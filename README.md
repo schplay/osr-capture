@@ -18,19 +18,25 @@ Built for FreeShow (https://github.com/ChurchApps/FreeShow), but generic.
 
 ## Platform support
 
-- **Windows** — Direct3D 11 (`OpenSharedResource` / `OpenSharedResource1` + staging texture). ✅
-- **macOS** (IOSurface) / **Linux** (dmabuf) — not yet implemented; callers should fall back to CPU-mode
-  offscreen capture where this addon is unavailable.
+| Platform | Backend | Status |
+| --- | --- | --- |
+| Windows | Direct3D 11 (`OpenSharedResource` + staging texture) | Implemented & validated |
+| macOS | IOSurface (`IOSurfaceLock` + row copy) | Implemented — needs testing on macOS |
+| Linux | dmabuf `mmap` (LINEAR modifier) | Implemented for linear buffers — needs testing; **tiled/compressed modifiers require an EGL `EGL_LINUX_DMA_BUF_EXT` → `glReadPixels` GPU-import path (TODO)** |
+
+Where the addon fails to load or a readback isn't supported for the given frame, callers should fall back
+to CPU-mode offscreen capture.
 
 ## API
 
 ```ts
 import osr from "osr-capture"
 
-// handle: the 8-byte Buffer from paint's texture.textureInfo.sharedTextureHandle
-// width/height: texture.textureInfo.codedSize
+// source (Windows/macOS): the 8-byte Buffer from paint's texture.textureInfo.sharedTextureHandle
+// source (Linux):         { planes: texture.textureInfo.planes, modifier: texture.textureInfo.modifier }
+// width/height:           texture.textureInfo.codedSize
 // resolves to a tightly-packed BGRA buffer (width * 4 * height bytes)
-osr.readback(handle: Buffer, width: number, height: number): Promise<Buffer>
+osr.readback(source: Buffer | { planes, modifier }, width: number, height: number): Promise<Buffer>
 ```
 
 ## Usage (Electron main process)
@@ -49,7 +55,8 @@ win.webContents.on("paint", async (event) => {
     if (!info) return
     try {
         const { width, height } = info.codedSize
-        const bgra = await osr.readback(info.sharedTextureHandle, width, height)
+        const source = process.platform === "linux" ? { planes: info.planes, modifier: info.modifier } : info.sharedTextureHandle
+        const bgra = await osr.readback(source, width, height)
         // ... hand `bgra` to your encoder / sender ...
     } finally {
         // REQUIRED: release every texture or the compositor frame pool drains and paints stop
