@@ -1,0 +1,21 @@
+{
+    "name": "osr-capture",
+    "version": "0.0.1",
+    "description": "Read back Electron OSR shared GPU textures (D3D11) to CPU buffers off the main thread",
+    "main": "index.js",
+    "types": "index.d.ts",
+    "gypfile": true,
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/schplay/osr-capture.git"
+    },
+    "keywords": ["electron", "offscreen", "osr", "shared-texture", "d3d11", "gpu", "capture", "readback"],
+    "os": ["win32"],
+    "engines": {
+        "node": ">=18"
+    },
+    "dependencies": {
+        "node-addon-api": "^8.3.0"
+    }
+}
