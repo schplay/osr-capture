@@ -10,6 +10,8 @@
 
 #include <cstring>
 
+#include "convert.h"
+
 namespace osrcap {
 
 namespace {
@@ -19,7 +21,10 @@ constexpr uint64_t kModifierLinear = 0;
 constexpr uint64_t kModifierInvalid = 0x00ffffffffffffffULL;
 }  // namespace
 
-bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, std::vector<uint8_t>& out, std::string& err) {
+bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, std::vector<uint8_t>& out, std::string& err) {
+    // LINEAR dmabufs are read back as BGRA (below). When the caller asks for UYVY/UYVA we convert on the
+    // CPU (ConvertBgraInPlace) so Linux gets the same reduced NDI/SDI wire format as Windows. A GPU (EGL/GL
+    // import + shader) convert for tiled buffers is future work — see osr-capture HANDOFF.
     if (planes.empty()) {
         err = "no dmabuf planes";
         return false;
@@ -47,6 +52,9 @@ bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, u
     }
 
     munmap(mapped, mapLength);
+
+    // format 1 = UYVY, 2 = UYVA: convert the BGRA we just read; 0 leaves it as BGRA.
+    ConvertBgraInPlace(out, width, height, format);
     return true;
 }
 

@@ -7,9 +7,14 @@
 
 #include <cstring>
 
+#include "convert.h"
+
 namespace osrcap {
 
-bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, std::vector<uint8_t>& out, std::string& err) {
+bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int format, std::vector<uint8_t>& out, std::string& err) {
+    // The IOSurface readback is BGRA. When the caller asks for UYVY/UYVA we convert on the CPU here
+    // (ConvertBgraInPlace) so macOS gets the same reduced NDI/SDI wire format as Windows. A GPU (Metal
+    // compute) convert on the IOSurface is a future optimization — see osr-capture HANDOFF.
     IOSurfaceRef surface = reinterpret_cast<IOSurfaceRef>(handle);
     if (!surface) {
         err = "null IOSurface handle";
@@ -37,6 +42,9 @@ bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, std::vect
     }
 
     IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
+
+    // format 1 = UYVY, 2 = UYVA: convert the BGRA we just read; 0 leaves it as BGRA.
+    ConvertBgraInPlace(out, width, height, format);
     return true;
 }
 

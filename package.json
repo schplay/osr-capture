@@ -11,7 +11,7 @@
         "url": "git+https://github.com/schplay/osr-capture.git"
     },
     "keywords": ["electron", "offscreen", "osr", "shared-texture", "d3d11", "gpu", "capture", "readback"],
-    "os": ["win32"],
+    "os": ["win32", "darwin", "linux"],
     "engines": {
         "node": ">=18"
     },
