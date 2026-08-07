@@ -79,6 +79,13 @@ void ConvertBgraToUyvaRaw(const uint8_t* bgra, uint32_t width, uint32_t height, 
 }
 
 bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t height, int format) {
+    // format 3 = RGBA: swap the R and B channels in place (for WebRTC's ImageData, which is RGBA). Same size.
+    if (format == 3) {
+        uint8_t* p = buf.data();
+        const size_t n = static_cast<size_t>(width) * height;
+        for (size_t i = 0; i < n; ++i) std::swap(p[i * 4], p[i * 4 + 2]);
+        return true;
+    }
     if (format != 1 && format != 2) return false;
     std::vector<uint8_t> converted;
     if (format == 2) {

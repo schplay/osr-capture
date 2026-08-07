@@ -35,7 +35,17 @@ struct BufferPool {
     int next = 0;
     Napi::Reference<Napi::Buffer<uint8_t>> bufs[POOL_N];
 };
-std::map<std::string, BufferPool> g_pools;
+
+// Per-ENV pool map, held as N-API instance data. The addon is loaded in BOTH the main thread and the NDI
+// worker thread. A single process-global map was (a) a data race — both threads insert/erase concurrently —
+// and (b) worse, the worker's releasePool() could destroy Napi::References that were CREATED on the main env
+// (main-path readback uses a bare `id` key; the worker uses `id#slot`), and destroying a reference on a
+// different env than created it is undefined behaviour. Per-env instance data gives each thread its own pools,
+// finalized on that env's own teardown (on the right thread), so references are only ever created and
+// destroyed on their owning env, with no shared mutable state to race on.
+struct AddonData {
+    std::map<std::string, BufferPool> pools;
+};
 
 class ReadbackWorker : public Napi::AsyncWorker {
 public:
@@ -98,7 +108,9 @@ private:
 // else a fresh per-call buffer (probe/other callers). Reallocates a pool when the frame size changes.
 Napi::Buffer<uint8_t> AcquireOutputBuffer(Napi::Env env, const std::string& poolKey, size_t outSize) {
     if (poolKey.empty()) return Napi::Buffer<uint8_t>::New(env, outSize);
-    BufferPool& pool = g_pools[poolKey];
+    AddonData* data = env.GetInstanceData<AddonData>();
+    if (!data) return Napi::Buffer<uint8_t>::New(env, outSize);
+    BufferPool& pool = data->pools[poolKey];
     if (pool.size != outSize) {
         for (int i = 0; i < POOL_N; ++i) pool.bufs[i] = Napi::Persistent(Napi::Buffer<uint8_t>::New(env, outSize));
         pool.size = outSize;
@@ -272,8 +284,11 @@ Napi::Value ReleasePool(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (info.Length() > 0 && info[0].IsString()) {
         std::string key = info[0].As<Napi::String>().Utf8Value();
-        g_pools.erase(key);
-        g_pools.erase(key + "#scaled");
+        // Only ever touch THIS env's pools (see AddonData) so we never destroy another thread/env's references.
+        if (AddonData* data = env.GetInstanceData<AddonData>()) {
+            data->pools.erase(key);
+            data->pools.erase(key + "#scaled");
+        }
 #if defined(_WIN32)
         osrcap::ReadbackReleaseKey(key);
 #endif
@@ -288,6 +303,10 @@ void RegisterConvert(Napi::Env env, Napi::Object exports);
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+    // Per-env pool storage (see AddonData). N-API runs Init once per env (main thread + each worker), and
+    // finalizes this instance data on that env's teardown, on the env's own thread — the correct place to
+    // destroy its Napi::References.
+    env.SetInstanceData(new AddonData());
     exports.Set("readback", Napi::Function::New(env, Readback));
     exports.Set("releasePool", Napi::Function::New(env, ReleasePool));
 #if defined(_WIN32)

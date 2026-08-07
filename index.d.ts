@@ -16,12 +16,14 @@ declare module "osr-capture" {
      * - `0` BGRA — tightly-packed `width * 4 * height`.
      * - `1` UYVY — packed 4:2:2 `width * 2 * height` (opaque; e.g. NDI/SDI without alpha).
      * - `2` UYVA — UYVY plane `width * 2 * height` + full-res alpha plane `width * height` (NDI with alpha).
+     * - `3` RGBA — tightly-packed `width * 4 * height` (BGRA with R/B swapped; e.g. WebRTC's ImageData).
      *
-     * On Windows the conversion is done on the GPU (D3D11 compute shader) during readback. On macOS/Linux it
-     * is a CPU convert applied to the BGRA readback (BT.601 full range); the reduced wire format still avoids
-     * the sender SDK's own (slow) conversion. A GPU convert on macOS (Metal) / Linux (EGL/GL) is future work.
+     * On Windows the conversion/swizzle is done on the GPU (D3D11 compute shader) during readback. On
+     * macOS/Linux it is a CPU convert applied to the BGRA readback (BT.601 full range for 1/2, channel swap for
+     * 3); the reduced/native format still avoids a per-frame CPU convert on the app's main thread. A GPU convert
+     * on macOS (Metal) / Linux (EGL/GL) is future work.
      */
-    export type ReadbackFormat = 0 | 1 | 2
+    export type ReadbackFormat = 0 | 1 | 2 | 3
 
     /**
      * Read back an Electron OSR shared texture into a CPU buffer, off the main thread.

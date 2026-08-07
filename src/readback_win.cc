@@ -157,12 +157,42 @@ struct DsParams {
     uint32_t dstH;
 };
 
+// BGRA -> RGBA channel swap on the GPU (for WebRTC's ImageData, which is RGBA). Same size as the source, so the
+// only cost over a plain BGRA readback is the swizzle, which the GPU does for free while the readback runs.
+const char* kSwizzleHLSL = R"HLSL(
+Texture2D<float4> gSrc : register(t0);
+RWByteAddressBuffer gDst : register(u0);
+cbuffer SwParams : register(b0) {
+    uint gWidth; uint gHeight;
+};
+int toByte(float v) { return (int)(v * 255.0 + 0.5); }
+[numthreads(8, 8, 1)]
+void SwizzleMain(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= gWidth || tid.y >= gHeight) return;
+    float4 c = gSrc.Load(int3(tid.x, tid.y, 0));  // .r=R .g=G .b=B .a=A
+    uint word = (uint)toByte(c.r) | ((uint)toByte(c.g) << 8) | ((uint)toByte(c.b) << 16) | ((uint)toByte(c.a) << 24);
+    gDst.Store((tid.y * gWidth + tid.x) * 4, word);  // R,G,B,A byte order = RGBA
+}
+)HLSL";
+
+// D3D11 constant buffers must be a multiple of 16 bytes, so pad to 16 (the shader only reads width/height).
+struct SwParams {
+    uint32_t width;
+    uint32_t height;
+    uint32_t pad0;
+    uint32_t pad1;
+};
+
 struct ReadbackContext {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11Device1> device1;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11ComputeShader> shader;
     ComPtr<ID3D11Buffer> paramsCb;
+
+    // BGRA->RGBA swizzle (WebRTC) shader + its params; reuses outBuf/outStaging for the output
+    ComPtr<ID3D11ComputeShader> swizzleShader;
+    ComPtr<ID3D11Buffer> swizzleParamsCb;
 
     // BGRA path staging
     ComPtr<ID3D11Texture2D> staging;
@@ -211,6 +241,19 @@ struct ReadbackContext {
         cb.Usage = D3D11_USAGE_DEFAULT;
         cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         return SUCCEEDED(device->CreateBuffer(&cb, nullptr, &paramsCb));
+    }
+
+    bool EnsureSwizzleShader() {
+        if (swizzleShader && swizzleParamsCb) return true;
+        ComPtr<ID3DBlob> blob, errBlob;
+        HRESULT hr = D3DCompile(kSwizzleHLSL, strlen(kSwizzleHLSL), "swizzle.hlsl", nullptr, nullptr, "SwizzleMain", "cs_5_0", 0, 0, &blob, &errBlob);
+        if (FAILED(hr)) return false;
+        if (FAILED(device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &swizzleShader))) return false;
+        D3D11_BUFFER_DESC cb = {};
+        cb.ByteWidth = sizeof(SwParams);
+        cb.Usage = D3D11_USAGE_DEFAULT;
+        cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        return SUCCEEDED(device->CreateBuffer(&cb, nullptr, &swizzleParamsCb));
     }
 
     bool EnsureStaging(UINT w, UINT h) {
@@ -373,6 +416,45 @@ struct ReadbackContext {
         return true;
     }
 
+    // GPU BGRA->RGBA swizzle readback (format 3, WebRTC). Same size as BGRA; the swizzle runs on the GPU so the
+    // main process never does the channel swap. Mirrors ReadbackConvert but outputs full-res RGBA.
+    bool ReadbackRgba(ID3D11Texture2D* shared, uint32_t width, uint32_t height, std::vector<uint8_t>& out, std::string& err) {
+        if (!EnsureSwizzleShader()) { err = "swizzle shader init failed"; return false; }
+        const size_t total = (size_t)width * 4 * height;
+        if (!EnsureOutBuffer(total)) { err = "output buffer creation failed"; return false; }
+
+        ComPtr<ID3D11ShaderResourceView> srv;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateShaderResourceView(shared, &sv, &srv))) { err = "SRV creation failed"; return false; }
+
+        SwParams p{ width, height };
+        context->UpdateSubresource(swizzleParamsCb.Get(), 0, nullptr, &p, 0, 0);
+        ID3D11ShaderResourceView* srvs[] = { srv.Get() };
+        ID3D11UnorderedAccessView* uavs[] = { outUav.Get() };
+        ID3D11Buffer* cbs[] = { swizzleParamsCb.Get() };
+        context->CSSetShader(swizzleShader.Get(), nullptr, 0);
+        context->CSSetShaderResources(0, 1, srvs);
+        context->CSSetUnorderedAccessViews(0, 1, uavs, nullptr);
+        context->CSSetConstantBuffers(0, 1, cbs);
+        context->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+
+        ID3D11ShaderResourceView* nullSrv[] = { nullptr };
+        ID3D11UnorderedAccessView* nullUav[] = { nullptr };
+        context->CSSetShaderResources(0, 1, nullSrv);
+        context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+
+        context->CopyResource(outStaging.Get(), outBuf.Get());
+        D3D11_MAPPED_SUBRESOURCE map = {};
+        if (FAILED(context->Map(outStaging.Get(), 0, D3D11_MAP_READ, 0, &map))) { err = "Map failed"; return false; }
+        out.resize(total);
+        ParallelStreamCopyFromWC(out.data(), map.pData, total, 8);
+        context->Unmap(outStaging.Get(), 0);
+        return true;
+    }
+
     bool Readback(uintptr_t handle, uint32_t width, uint32_t height, int format, std::vector<uint8_t>& out, std::string& err) {
         if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
 
@@ -387,6 +469,7 @@ struct ReadbackContext {
 
         bool ok;
         if (format == 1 || format == 2) ok = ReadbackConvert(shared.Get(), width, height, format == 2, out, err);
+        else if (format == 3) ok = ReadbackRgba(shared.Get(), width, height, out, err);
         else ok = ReadbackBgra(shared.Get(), width, height, out, err);
 
         if (haveKeyedMutex) keyedMutex->ReleaseSync(0);
