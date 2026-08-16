@@ -65,6 +65,18 @@ declare module "osr-capture" {
      */
     export function readbackFinish(poolKey: string, width: number, height: number, format?: ReadbackFormat, dstWidth?: number, dstHeight?: number): Promise<Buffer | { main: Buffer; scaled: Buffer }>
 
+    /**
+     * SINGLE-DISPATCH readback (WINDOWS ONLY) — the collapse of {@link readbackConsume} + {@link readbackFinish}
+     * into ONE N-API async op (plan §11 fix #1). Runs open + GPU-convert + GPU-wait + copy-out in one worker
+     * dispatch and calls `onRelease` EXACTLY ONCE, the instant the GPU has consumed the shared texture (before
+     * the slow copy-out) — so the caller releases the Electron texture just as early as two-phase, without the
+     * second dispatch/resume hop or the JS-loop hop between phases.
+     *
+     * `dstWidth`/`dstHeight` > 0 also GPU-downscales in the same pass; the promise then resolves `{ main, scaled }`,
+     * else just the `format` `Buffer`. `poolKey` selects the reused output-buffer pool (as {@link readbackFinish}).
+     */
+    export function readbackOnce(source: Buffer | DmabufInfo, width: number, height: number, format: ReadbackFormat, poolKey: string, dstWidth: number, dstHeight: number, onRelease: () => void): Promise<Buffer | { main: Buffer; scaled: Buffer }>
+
     /** CPU BGRA -> UYVY (4:2:2, `width * 2 * height`). Synchronous fallback converter. */
     export function convertBgraToUyvy(bgra: Buffer, width: number, height: number): Buffer
 

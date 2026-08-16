@@ -10,7 +10,7 @@
                     "OS=='win'",
                     {
                         "sources": ["src/readback_win.cc"],
-                        "libraries": ["d3d11.lib", "dxgi.lib", "d3dcompiler.lib"],
+                        "libraries": ["d3d11.lib", "d3d12.lib", "dxgi.lib", "d3dcompiler.lib"],
                         "msvs_settings": {
                             "VCCLCompilerTool": {
                                 "ExceptionHandling": 1,
@@ -39,5 +39,35 @@
                 ]
             ]
         }
+    ],
+    "conditions": [
+        [
+            "OS=='win'",
+            {
+                "targets": [
+                    {
+                        # Stage-2 sub-step A harness (plan §10): standalone exe, no Electron/node at
+                        # runtime. #includes src/readback_win.cc so the convert code under test is the
+                        # addon's own, unforked. Built by the same `node-gyp rebuild` as the addon;
+                        # output: build/Release/on12_harness.exe. See test/on12_harness.cc header.
+                        "target_name": "on12_harness",
+                        "type": "executable",
+                        "win_delay_load_hook": "false",
+                        "sources": ["test/on12_harness.cc"],
+                        "defines": ["NOMINMAX"],
+                        "libraries": ["d3d11.lib", "d3d12.lib", "dxgi.lib", "d3dcompiler.lib", "winmm.lib"],
+                        "msvs_settings": {
+                            "VCCLCompilerTool": {
+                                "ExceptionHandling": 1,
+                                "AdditionalOptions": ["/std:c++17"]
+                            },
+                            "VCLinkerTool": {
+                                "SubSystem": 1
+                            }
+                        }
+                    }
+                ]
+            }
+        ]
     ]
 }

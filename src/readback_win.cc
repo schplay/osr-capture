@@ -9,18 +9,24 @@
 
 #include <windows.h>
 #include <d3d11_1.h>
+#include <d3d11on12.h>
+#include <d3d12.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 
 #include <smmintrin.h>  // SSE4.1: _mm_stream_load_si128 (MOVNTDQA) for fast reads of WC GPU-mapped memory
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,24 +48,239 @@ inline void StreamCopyFromWC(void* dst, const void* src, size_t bytes) {
     if (done < bytes) std::memcpy(static_cast<char*>(dst) + done, static_cast<const char*>(src) + done, bytes - done);
 }
 
-// Reading the GPU-mapped readback staging is LATENCY-bound (BAR/VRAM over PCIe): a single thread stalls on
-// each transaction (~400 MB/s), so a 4K frame's ~16-25MB takes 60-80ms. Splitting the read across threads
-// overlaps the latencies and multiplies effective throughput. Chunks are 16-byte aligned for MOVNTDQA.
-inline void ParallelStreamCopyFromWC(void* dst, const void* src, size_t bytes, unsigned threads) {
-    if (threads <= 1 || bytes < (1u << 16)) {
-        StreamCopyFromWC(dst, src, bytes);
-        return;
+// GPU-mapped readback staging is LATENCY-bound (BAR/VRAM over PCIe, ~400 MB/s single-threaded), so a 4K frame
+// is split across threads to overlap the stalls. A persistent, process-global pool of workers pulls fixed-SIZE
+// chunks from a shared FIFO queue. This CAPS total concurrent copy threads regardless of how many readbacks
+// are in flight — previously each readback spawned its own 8 threads (~48 under load) that oversubscribed the
+// CPU and made readbacks finish in CLUSTERS (the delivery convoy). The shared queue also interleaves chunks
+// from concurrent frames, spreading their completions. The pool is process-lifetime (intentionally leaked — no
+// static-dtor join/terminate, OS reclaims at exit) and copies only into C++ vectors (never V8 buffers), so
+// there is no per-env teardown/lifetime hazard.
+//
+// SIZING (plan §11 CV#1): the worker count is MEASURED at runtime, never guessed. hardware_concurrency() is
+// used ONLY as a STRUCTURAL ceiling on how many workers are PARKED; the operating point `active_n` (how many
+// may dequeue) self-calibrates to the throughput KNEE of the real chunk stream: WC/BAR copies saturate the
+// link at some worker count, past which extra workers add zero copy throughput and pure CPU burn (stolen from
+// the SpeedHQ send). Every batch (one Run() call) yields a bytes/wall-time sample; a duty-cycled A/B collects
+// equal sample counts from `active_n` and `active_n ± 1` in interleaved sub-blocks (so load drift cancels)
+// and moves `active_n` by the SIGN of the median difference — no percent thresholds, no tuned margins; the
+// only hysteresis is integer replication on the climb (see Decide). The duty cycle IS the steady state (the
+// pool re-probes both neighbours forever, tracking knee movement with GPU load/thermals); "settled" means the
+// BASE stops drifting — a ±1 dither during probe windows is by construction, not oscillation. Workers run at
+// THREAD_PRIORITY_BELOW_NORMAL [STRUCTURAL — an OS mechanism, not a value]: WC copies are memory-stall-bound
+// so idle-core cost is ~nil, and under contention the OS scheduler (itself a measuring, adapting system)
+// awards the CPU to the compress.
+class CopyPool {
+public:
+    static CopyPool& Get() {
+        static CopyPool* inst = new CopyPool();  // leaked on purpose: process-lifetime pool
+        return *inst;
     }
-    size_t chunk = (bytes / threads) & ~size_t(15);
-    std::vector<std::thread> pool;
-    pool.reserve(threads - 1);
-    for (unsigned t = 1; t < threads; ++t) {
-        size_t off = static_cast<size_t>(t) * chunk;
-        size_t len = (t == threads - 1) ? bytes - off : chunk;
-        pool.emplace_back([=]() { StreamCopyFromWC(static_cast<char*>(dst) + off, static_cast<const char*>(src) + off, len); });
+
+    // Split [src, bytes) into chunks, run them across the pool, and BLOCK until all complete (so src/dst stay
+    // valid for the whole copy). `remaining` is set before any worker can observe a job, so it's race-free.
+    // Each completed batch feeds one bytes/wall-time sample to the calibrator (the CV#1 MEASURED signal).
+    void Run(void* dst, const void* src, size_t bytes) {
+        if (parked_ == 0 || bytes < kInlineFloor) {
+            StreamCopyFromWC(dst, src, bytes);
+            return;
+        }
+        const size_t nchunks = (bytes + kChunk - 1) / kChunk;
+        auto batch = std::make_shared<Batch>();
+        batch->remaining = static_cast<int>(nchunks);
+        const uint64_t epoch = epoch_.load();  // tag the batch with the calibration arm it starts under
+        const auto t0 = std::chrono::steady_clock::now();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (size_t off = 0; off < bytes; off += kChunk) {
+                const size_t len = (bytes - off < kChunk) ? (bytes - off) : kChunk;
+                queue_.push_back(Job{static_cast<char*>(dst) + off, static_cast<const char*>(src) + off, len, batch});
+            }
+        }
+        cv_.notify_all();
+        {
+            std::unique_lock<std::mutex> lk(batch->mu);
+            batch->done.wait(lk, [&] { return batch->remaining == 0; });
+        }
+        const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (sec > 0) OnBatchSample(static_cast<double>(bytes) / sec, epoch);
     }
-    StreamCopyFromWC(dst, src, chunk);  // this thread does chunk 0
-    for (auto& th : pool) th.join();
+
+    // Telemetry ("observability, not knobs"): the calibrated BASE operating point. During probe windows the
+    // instantaneous eligible count dithers ±1 around this by construction; the base is the settled value.
+    unsigned ActiveWorkers() const { return base_.load(); }
+
+private:
+    static constexpr size_t kChunk = 1u << 20;        // 1 MiB — a fixed SIZE (universal plateau), NOT a thread count
+    static constexpr size_t kInlineFloor = 1u << 16;  // tiny copies run inline on the caller
+    // Samples per A/B arm [UNIVERSAL — a statistics property, identical on every machine]: enough for a stable
+    // median (odd, so the median is a real sample), few enough that a full A/B cycle spans about a second of
+    // 4K video (~120 batches/s), keeping knee-tracking at window granularity.
+    static constexpr size_t kArmSamples = 15;
+    // Arm alternation block [UNIVERSAL — paired-comparison structure, not a tuned value]: the two arms are
+    // measured in interleaved sub-blocks (A,B,A,B,...) rather than one long window each, so slow drift in the
+    // offered load (concurrent outputs starting/stopping, GPU load) biases BOTH arms equally and cancels in
+    // the median comparison. Any block giving >=2 blocks per arm works (plateau); kArmSamples/3 gives 3.
+    static constexpr size_t kBlock = kArmSamples / 3;
+
+    struct Batch {
+        int remaining = 0;  // guarded by mu
+        std::mutex mu;
+        std::condition_variable done;
+    };
+    struct Job {
+        char* dst;
+        const char* src;
+        size_t len;
+        std::shared_ptr<Batch> batch;
+    };
+
+    CopyPool() {
+        const unsigned hc = std::thread::hardware_concurrency();
+        parked_ = hc > 0 ? hc : 1;  // STRUCTURAL ceiling: no more CPU-bound threads than logical cores can help
+        logStats_ = std::getenv("FS_CAP_STATS") != nullptr;  // telemetry gate (verification), not a tuning knob
+        lastLog_ = std::chrono::steady_clock::now();
+        // Park `parked_` workers; only the first `active_` are eligible to dequeue. Start at 1 and climb.
+        for (unsigned i = 0; i < parked_; ++i) std::thread([this, i] { WorkerLoop(i); }).detach();
+    }
+
+    void WorkerLoop(unsigned index) {
+        // BELOW_NORMAL delegates the instantaneous copy-vs-compress CPU split to the OS scheduler: on idle
+        // cores a stall-bound copy thread loses ~nothing, under contention the compress wins the core.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return !queue_.empty() && index < active_.load(); });
+                job = std::move(queue_.front());
+                queue_.pop_front();
+            }
+            StreamCopyFromWC(job.dst, job.src, job.len);
+            std::lock_guard<std::mutex> lk(job.batch->mu);
+            if (--job.batch->remaining == 0) job.batch->done.notify_one();
+        }
+    }
+
+    // Calibrator: collect kArmSamples per arm — base and base±1 in INTERLEAVED kBlock sub-blocks (paired
+    // comparison, see kBlock) — then move the base by the sign of the median difference. Samples whose batch
+    // spanned an arm switch (epoch mismatch) belong to neither arm and are discarded — equal-count windows
+    // must be clean.
+    void OnBatchSample(double bytesPerSec, uint64_t epoch) {
+        std::lock_guard<std::mutex> lk(calibMu_);
+        if (parked_ < 2) return;  // one core: nothing to calibrate, active_n stays 1
+        if (epoch != epoch_.load()) return;
+        std::vector<double>& arm = onProbeArm_ ? probeSamples_ : baseSamples_;
+        if (arm.size() < kArmSamples) {
+            arm.push_back(bytesPerSec);
+            ++blockFill_;
+        }
+        if (baseSamples_.size() >= kArmSamples && probeSamples_.size() >= kArmSamples) {
+            Decide();
+            return;
+        }
+        if (blockFill_ >= kBlock || arm.size() >= kArmSamples) {
+            blockFill_ = 0;
+            std::vector<double>& other = onProbeArm_ ? baseSamples_ : probeSamples_;
+            if (other.size() < kArmSamples) {  // else keep filling this arm — the other is already complete
+                onProbeArm_ = !onProbeArm_;
+                const unsigned b = base_.load();
+                SetActive(onProbeArm_ ? static_cast<unsigned>(static_cast<int>(b) + probeDir_) : b);
+            }
+        }
+    }
+
+    void Decide() {  // calibMu_ held; both arms have kArmSamples samples
+        const double mBase = Median(baseSamples_);
+        const double mProbe = Median(probeSamples_);
+        const unsigned oldBase = base_.load();
+        unsigned newBase = oldBase;
+        // Sign-of-median-difference decisions (universal rules, no tuned margins):
+        //  up-probe:  a climb requires the strict gain to REPLICATE across 2 consecutive up-probe cycles —
+        //             the same integer-replication hysteresis CV#2 uses, applied because on the plateau past
+        //             the knee the sign of a single A/B is pure noise (an unbiased random walk that never
+        //             settles). Adding CPU burn bears the burden of replicated proof.
+        //  down-probe: drop the top worker whenever removing it did NOT reduce median throughput — single
+        //             cycle, because the objective is max throughput for MINIMUM CPU: below the knee the
+        //             drop reliably loses the A/B (real throughput loss), so a noise-drop at the knee is
+        //             rare and the next replicated up-probe gain undoes it.
+        if (probeDir_ > 0) {
+            if (mProbe > mBase) {
+                if (++upWins_ >= 2) {
+                    newBase = oldBase + 1;
+                    upWins_ = 0;
+                }
+            } else {
+                upWins_ = 0;
+            }
+        } else {
+            if (mProbe >= mBase) {
+                newBase = oldBase - 1;
+                upWins_ = 0;  // the top worker was surplus — stale half-climb evidence dies with it
+            }
+        }
+        if (logStats_) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastLog_ >= std::chrono::seconds(1)) {  // rate-limit: decisions run ~4/s at 4K60
+                lastLog_ = now;
+                fprintf(stderr, "[COPY-POOL] active_n=%u (was %u; probe %+d: base %.0f vs probe %.0f MB/s -> %s) parked=%u\n",
+                        newBase, oldBase, probeDir_, mBase / 1e6, mProbe / 1e6,
+                        newBase > oldBase ? "climb" : (newBase < oldBase ? "drop" : "hold"), parked_);
+                fflush(stderr);
+            }
+        }
+        base_.store(newBase);
+        baseSamples_.clear();
+        probeSamples_.clear();
+        onProbeArm_ = false;
+        blockFill_ = 0;
+        // Duty cycle: alternate the probe direction so BOTH neighbours are re-tested forever (knee tracking).
+        // At the structural bounds only the valid direction is probed.
+        probeDir_ = -probeDir_;
+        if (probeDir_ > 0 && newBase >= parked_) probeDir_ = -1;
+        if (probeDir_ < 0 && newBase <= 1) probeDir_ = +1;
+        SetActive(newBase);
+    }
+
+    void SetActive(unsigned n) {  // calibMu_ held (single writer); lock order calibMu_ -> mu_ (never reversed)
+        {
+            std::lock_guard<std::mutex> lk(mu_);  // publish under the queue lock so no parked waiter misses it
+            active_.store(n);
+        }
+        epoch_.fetch_add(1);  // in-flight batches tagged with the old epoch are discarded on completion
+        cv_.notify_all();
+    }
+
+    static double Median(const std::vector<double>& v) {
+        std::vector<double> tmp(v);
+        const size_t mid = tmp.size() / 2;
+        std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
+        return tmp[mid];
+    }
+
+    unsigned parked_ = 0;               // STRUCTURAL: spawned workers (= hardware_concurrency ceiling)
+    std::atomic<unsigned> active_{1};   // instantaneous eligible-to-dequeue count (dithers during probes)
+    std::atomic<unsigned> base_{1};     // calibrated operating point (the observable "settled" value)
+    std::atomic<uint64_t> epoch_{1};    // bumped on every arm switch; stale-tagged samples are discarded
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<Job> queue_;
+
+    // calibrator state (guarded by calibMu_)
+    std::mutex calibMu_;
+    std::vector<double> baseSamples_, probeSamples_;
+    bool onProbeArm_ = false;  // which arm the current sub-block measures
+    size_t blockFill_ = 0;     // samples accepted into the current sub-block
+    int probeDir_ = +1;        // start at active_n=1 and climb
+    int upWins_ = 0;           // consecutive up-probe wins (climb replication hysteresis)
+    bool logStats_ = false;
+    std::chrono::steady_clock::time_point lastLog_;
+};
+
+// Route the parallel WC copy through the global pool. `threads` is now IGNORED (the pool self-sizes to the
+// machine); the parameter is kept so the call sites are unchanged.
+inline void ParallelStreamCopyFromWC(void* dst, const void* src, size_t bytes, unsigned /*threads*/) {
+    CopyPool::Get().Run(dst, src, bytes);
 }
 }  // namespace
 
@@ -120,6 +341,51 @@ struct Params {
     uint32_t uyvySize;
     uint32_t writeAlpha;
 };
+
+// ---------------------------------------------------------------------------------------------------------
+// Stage-2 sub-step B (plan §5 ladder / §10 harness soak): backend selection for the CONVERT copy-out.
+// Preferred: D3D11On12 — a D3D12 device wrapped via D3D11On12CreateDevice runs every line of the existing
+// D3D11 consume code unchanged; the convert output lands in a wrapped D3D12 UAV buffer, a D3D12 COPY-queue
+// CopyBufferRegion moves it into a D3D12_HEAP_TYPE_READBACK buffer (WRITE_BACK / CPU-cached by spec), and a
+// SINGLE-DEVICE copy-queue fence (SetEventOnCompletion + WaitForSingleObject) replaces the WaitGpu busy-spin.
+// Soak-measured (on12_harness, GATE-C2): ~ -50% process CPU at identical 3x4K60 throughput — the spin dies
+// and the copy-out becomes a cached memcpy, freeing the CPU the concurrent SpeedHQ compresses are starved of.
+// Pre-registered NOT to move single-output done (~1.1x copy-out); the target is TWO-output sentReal + CPU.
+// LADDER (never crash, always degrade): any 11On12/D3D12 init failure -> process-wide fallback to the classic
+// D3D11 WC-staging path (byte-identical to the shipping build); D3D11 failure -> the JS side falls back to
+// CPU OSR. NOT the abandoned cross-device ID3D11Fence (TDR'd): one device, one fence, one queue — the exact
+// construction the harness gate matrix passed (byte-exact, zero TDR, clean teardown).
+// FS_READBACK=d3d11 forces the classic path — a binary DIAGNOSTIC selector for in-app A/B verification
+// (observability, like FS_CAP_STATS), not a tuned perf knob; there is no value for a human to sweep.
+std::atomic<bool> g_on12Disabled{false};
+std::atomic<int> g_backendState{0};  // 0 = no device yet, 1 = d3d11on12, 2 = d3d11 (classic / disabled)
+
+bool On12Allowed() {
+    static const bool envForced = [] {
+        const char* v = std::getenv("FS_READBACK");
+        return v && std::strcmp(v, "d3d11") == 0;
+    }();
+    if (envForced) return false;
+    return !g_on12Disabled.load();
+}
+
+void LogBackendOnce(const char* name, const char* detail) {
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    if (logged.compare_exchange_strong(expected, true)) {
+        fprintf(stderr, "[READBACK] backend=%s (%s)\n", name, detail);
+        fflush(stderr);
+    }
+}
+
+void DisableOn12(const char* reason) {
+    bool expected = false;
+    if (g_on12Disabled.compare_exchange_strong(expected, true)) {
+        g_backendState.store(2);
+        fprintf(stderr, "[READBACK] d3d11on12 disabled (%s) -> classic d3d11 WC-staging path\n", reason);
+        fflush(stderr);
+    }
+}
 
 // Box-filter downscale of the shared BGRA texture straight to a small tightly-packed BGRA buffer, ON THE GPU.
 // Used for server/stage/preview consumers of a mixed output: instead of reading back the full 4K frame and
@@ -222,12 +488,162 @@ struct ReadbackContext {
     // pending GPU-downscaled buffer (0 = none for this frame); dsOutStaging holds it after the GPU wait
     size_t pendingScaledTotal = 0;
 
+    // ---- Stage-2 sub-step B: D3D11On12 cached-readback state (see the ladder comment above Params) ----
+    // Per-context D3D12 chain, mirroring the existing per-context D3D11 device design (each pool entry is
+    // independent, no cross-context sync). All structural D3D objects — no perf constants.
+    ComPtr<ID3D12Device> d12;
+    ComPtr<ID3D12CommandQueue> d12Direct;  // backs the 11On12 device (all wrapped D3D11 work lands here)
+    ComPtr<ID3D12CommandQueue> d12Copy;    // dedicated COPY queue: convert output -> READBACK heap DMA
+    ComPtr<ID3D12Fence> d12Fence;          // SINGLE-device fence (the TDR-safe kind), monotonically valued
+    UINT64 d12FenceVal = 0;
+    HANDLE d12Event = nullptr;
+    ComPtr<ID3D12CommandAllocator> d12CopyAlloc;
+    ComPtr<ID3D12GraphicsCommandList> d12CopyList;
+    ComPtr<ID3D11On12Device> on12;
+    ComPtr<ID3D12Resource> convBuf12;  // DEFAULT-heap UAV buffer; wrapped into outBuf when outBufOn12
+    ComPtr<ID3D12Resource> rbBuf;      // READBACK heap (WRITE_BACK / CPU-cached), persistently mapped
+    void* rbPtr = nullptr;
+    bool on12Active = false;      // this context's device chain is 11On12 (vs classic D3D11)
+    bool on12OpenedOk = false;    // the 11On12 device has successfully opened an Electron shared texture
+    bool outBufOn12 = false;      // outBuf/outUav currently wrap convBuf12 (vs classic buffer + outStaging)
+    bool pendingOn12 = false;     // the pending convert output lives in rbBuf (vs outStaging)
+    UINT64 pendingCopyFence = 0;  // copy-queue completion value for the pending frame's DMA
+    bool deviceLost = false;      // fence watchdog fired / device removed -> rebuild the chain on next use
+
+    ~ReadbackContext() {
+        if (rbPtr && rbBuf) rbBuf->Unmap(0, nullptr);
+        if (d12Event) CloseHandle(d12Event);
+    }
+
+    // Full device-chain reset (both backends): every device-derived object dies with the device. Used when a
+    // backend init fails partway (fall back clean) and when the fence watchdog marks the device lost.
+    void ResetDeviceChain() {
+        shader.Reset();
+        paramsCb.Reset();
+        swizzleShader.Reset();
+        swizzleParamsCb.Reset();
+        staging.Reset();
+        stagingW = stagingH = 0;
+        outBuf.Reset();
+        outUav.Reset();
+        outStaging.Reset();
+        outBufSize = 0;
+        dsShader.Reset();
+        dsParamsCb.Reset();
+        dsOutBuf.Reset();
+        dsOutUav.Reset();
+        dsOutStaging.Reset();
+        dsOutBufSize = 0;
+        flushQuery.Reset();
+        pendingBgra.clear();
+        pendingTotal = pendingScaledTotal = 0;
+        if (rbPtr && rbBuf) rbBuf->Unmap(0, nullptr);
+        rbPtr = nullptr;
+        rbBuf.Reset();
+        convBuf12.Reset();
+        outBufOn12 = false;
+        pendingOn12 = false;
+        pendingCopyFence = 0;
+        on12.Reset();
+        d12CopyList.Reset();
+        d12CopyAlloc.Reset();
+        d12Fence.Reset();
+        d12FenceVal = 0;
+        if (d12Event) { CloseHandle(d12Event); d12Event = nullptr; }
+        context.Reset();
+        device1.Reset();
+        device.Reset();
+        d12Copy.Reset();
+        d12Direct.Reset();
+        d12.Reset();
+        on12Active = false;
+        on12OpenedOk = false;
+        deviceLost = false;
+    }
+
+    // Try the full 11On12 chain on the DEFAULT adapter (same adapter selection as the classic path). Any
+    // failure returns false with the chain partially built — the caller resets and degrades.
+    bool InitOn12() {
+        if (FAILED(D3D12CreateDevice(nullptr, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&d12)))) return false;
+        D3D12_COMMAND_QUEUE_DESC qd = {};
+        qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        if (FAILED(d12->CreateCommandQueue(&qd, IID_PPV_ARGS(&d12Direct)))) return false;
+        qd.Type = D3D12_COMMAND_LIST_TYPE_COPY;
+        if (FAILED(d12->CreateCommandQueue(&qd, IID_PPV_ARGS(&d12Copy)))) return false;
+        if (FAILED(d12->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&d12Fence)))) return false;
+        d12Event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!d12Event) return false;
+        if (FAILED(d12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&d12CopyAlloc))) ||
+            FAILED(d12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, d12CopyAlloc.Get(), nullptr, IID_PPV_ARGS(&d12CopyList))))
+            return false;
+        d12CopyList->Close();  // created open; keep the per-frame Reset pattern uniform (as in the harness)
+        IUnknown* queues[] = {d12Direct.Get()};
+        if (FAILED(D3D11On12CreateDevice(d12.Get(), D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, queues, 1, 0,
+                                         &device, &context, nullptr)))
+            return false;
+        if (FAILED(device.As(&device1)) || FAILED(device.As(&on12))) return false;
+        return true;
+    }
+
+    // Event-blocking fence wait (NO spin). On timeout/device-removal: mark the context lost (rebuilt on next
+    // use) and disable 11On12 process-wide — a watchdog trip is the exact TDR class the abandoned fence build
+    // taught us never to busy-retry; the classic path is the proven fallback.
+    bool WaitFenceOn12(UINT64 v, DWORD ms) {
+        if (!d12Fence) return true;
+        if (d12Fence->GetCompletedValue() >= v) return true;
+        if (FAILED(d12Fence->SetEventOnCompletion(v, d12Event))) { deviceLost = true; return false; }
+        if (WaitForSingleObject(d12Event, ms) == WAIT_OBJECT_0) return true;
+        deviceLost = true;
+        DisableOn12(d12->GetDeviceRemovedReason() != S_OK ? "device removed" : "copy/convert fence watchdog timeout");
+        return false;
+    }
+
     bool EnsureDevice() {
+        if (deviceLost) ResetDeviceChain();
         if (device1) return true;
+        // §5 ladder step 1: D3D11On12 (cached readback). Failure degrades to the classic path — process-wide,
+        // so later contexts don't re-pay a failing init per frame.
+        if (On12Allowed()) {
+            if (InitOn12()) {
+                on12Active = true;
+                int expected = 0;
+                g_backendState.compare_exchange_strong(expected, 1);
+                LogBackendOnce("d3d11on12", "cached D3D12 readback heap, copy-queue fence");
+                return true;
+            }
+            DisableOn12("D3D12/11On12 device init failed");
+            ResetDeviceChain();
+        }
+        // §5 ladder step 2: classic D3D11 (WC staging + WaitGpu) — byte-identical to the shipping build.
         UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
         D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
         if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, nullptr, 0, D3D11_SDK_VERSION, &device, &fl, &context))) return false;
-        return SUCCEEDED(device.As(&device1));
+        if (FAILED(device.As(&device1))) return false;
+        int expected = 0;
+        g_backendState.compare_exchange_strong(expected, 2);
+        LogBackendOnce("d3d11", "WC staging + WaitGpu");
+        return true;
+    }
+
+    // Open Electron's shared texture on this context's device, with the §5 ladder's one-shot open fallback:
+    // if the 11On12 device has NEVER successfully opened a shared texture and the open fails, treat 11On12 as
+    // incompatible with this driver's shared-handle path (structural, not a retry count), disable it
+    // process-wide, rebuild this context classic, and retry the open once. Once a context HAS opened
+    // successfully, later failures are treated as transient (resize churn, dead handle) exactly as today.
+    bool OpenSharedTex(uintptr_t handle, ComPtr<ID3D11Texture2D>& shared, std::string& err) {
+        if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
+        HRESULT hr = device1->OpenSharedResource1(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
+        if (FAILED(hr)) hr = device->OpenSharedResource(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
+        if ((FAILED(hr) || !shared) && on12Active && !on12OpenedOk) {
+            DisableOn12("OpenSharedResource failed on the 11On12 device");
+            ResetDeviceChain();
+            if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
+            hr = device1->OpenSharedResource1(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
+            if (FAILED(hr)) hr = device->OpenSharedResource(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
+        }
+        if (FAILED(hr) || !shared) { err = "OpenSharedResource failed"; return false; }
+        if (on12Active) on12OpenedOk = true;
+        return true;
     }
 
     bool EnsureShader() {
@@ -268,8 +684,36 @@ struct ReadbackContext {
         return true;
     }
 
+    // Release the on12 convert/readback pair (draining any in-flight copy-queue DMA first, so the DMA never
+    // reads/writes a dying buffer). Safe no-op when nothing on12 exists.
+    void ReleaseOn12OutBuffers() {
+        if (pendingCopyFence) { WaitFenceOn12(pendingCopyFence, 2000); pendingCopyFence = 0; }
+        if (rbPtr && rbBuf) rbBuf->Unmap(0, nullptr);
+        rbPtr = nullptr;
+        rbBuf.Reset();
+        convBuf12.Reset();
+        outBufOn12 = false;
+    }
+
+    // A CLASSIC-STAGING consumer (ReadbackConvert/ReadbackRgba/ConvertToStaging — they CopyResource into
+    // outStaging) is about to use outBuf: if the installed pair is the on12 wrap (no staging; needs
+    // Acquire/Release around every use), drop it so EnsureOutBuffer rebuilds the classic pair. Without this
+    // a coincidental byte-size match would early-return the WRAPPED buffer into a classic CopyResource
+    // (invalid) with a null outStaging. The on12 convert path (ConsumeShared) never calls this — its
+    // DispatchConvert must early-return on the installed wrapped pair, exactly like the harness's injection.
+    void InvalidateOn12OutBuffer() {
+        if (!outBufOn12) return;
+        ReleaseOn12OutBuffers();
+        outBuf.Reset();
+        outUav.Reset();
+        outBufSize = 0;
+    }
+
+    // "A convert-output buffer of this size is installed" — satisfied by the classic pair, the harness's
+    // injected wrap, or the live on12 wrap (EnsureOn12OutBuffer installs it before DispatchConvert runs).
     bool EnsureOutBuffer(size_t bytes) {
         if (outBuf && outBufSize == bytes) return true;
+        if (outBufOn12) ReleaseOn12OutBuffers();
         outBuf.Reset(); outUav.Reset(); outStaging.Reset();
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = (UINT)bytes;
@@ -290,6 +734,77 @@ struct ReadbackContext {
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(device->CreateBuffer(&sd, nullptr, &outStaging))) return false;
         outBufSize = bytes;
+        return true;
+    }
+
+    // On12 output pair (harness EnsureSize, folded in): a D3D12 DEFAULT UAV buffer wrapped into D3D11 as
+    // outBuf/outUav — so the UNCHANGED DispatchConvert writes straight into D3D12-owned memory — plus the
+    // CPU-cached READBACK-heap buffer the copy queue DMAs into, persistently mapped. Buffers have
+    // simultaneous-access state semantics (promote from / decay to COMMON at every ExecuteCommandLists), so
+    // COMMON in/out lets the COPY queue promote to COPY_SOURCE implicitly. On ANY failure: false — the caller
+    // falls back to the classic staging path for the frame (classic buffers work fine on the 11On12 device).
+    bool EnsureOn12OutBuffer(size_t bytes) {
+        if (outBufOn12 && outBufSize == bytes) return true;
+        // drain everything in flight before releasing the old pair, then drop any classic leftovers too
+        if (d12FenceVal && !WaitFenceOn12(d12FenceVal, 2000)) return false;
+        ReleaseOn12OutBuffers();
+        outBuf.Reset(); outUav.Reset(); outStaging.Reset();
+        outBufSize = 0;
+
+        D3D12_HEAP_PROPERTIES hp = {};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC bd = {};
+        bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bd.Width = bytes;
+        bd.Height = 1;
+        bd.DepthOrArraySize = 1;
+        bd.MipLevels = 1;
+        bd.Format = DXGI_FORMAT_UNKNOWN;
+        bd.SampleDesc.Count = 1;
+        bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        if (FAILED(d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&convBuf12)))) return false;
+
+        D3D11_RESOURCE_FLAGS f11 = {};
+        f11.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        f11.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        ComPtr<ID3D11Buffer> buf11;
+        if (FAILED(on12->CreateWrappedResource(convBuf12.Get(), &f11, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COMMON, IID_PPV_ARGS(&buf11)))) {
+            convBuf12.Reset();
+            return false;
+        }
+
+        // Same RAW R32_TYPELESS UAV desc as the classic EnsureOutBuffer; creation needs the wrap acquired.
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.FirstElement = 0;
+        ud.Buffer.NumElements = (UINT)(bytes / 4);
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        ComPtr<ID3D11UnorderedAccessView> uav;
+        HRESULT hr;
+        {
+            ID3D11Resource* res[] = {buf11.Get()};
+            on12->AcquireWrappedResources(res, 1);
+            hr = device->CreateUnorderedAccessView(buf11.Get(), &ud, &uav);
+            on12->ReleaseWrappedResources(res, 1);
+        }
+        if (FAILED(hr)) { convBuf12.Reset(); return false; }
+
+        hp.Type = D3D12_HEAP_TYPE_READBACK;
+        bd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        if (FAILED(d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&rbBuf))) ||
+            FAILED(rbBuf->Map(0, nullptr, &rbPtr))) {
+            rbBuf.Reset();
+            rbPtr = nullptr;
+            convBuf12.Reset();
+            return false;
+        }
+
+        outBuf = buf11;
+        outUav = uav;
+        outBufSize = bytes;
+        outBufOn12 = true;
         return true;
     }
 
@@ -375,6 +890,7 @@ struct ReadbackContext {
     }
 
     bool ReadbackConvert(ID3D11Texture2D* shared, uint32_t width, uint32_t height, bool alpha, std::vector<uint8_t>& out, std::string& err) {
+        InvalidateOn12OutBuffer();  // classic-staging consumer: never reuse an on12-wrapped outBuf
         if (!EnsureShader()) { err = "compute shader init failed"; return false; }
         const size_t uyvySize = (size_t)width * 2 * height;
         const size_t total = alpha ? uyvySize + (size_t)width * height : uyvySize;
@@ -419,6 +935,7 @@ struct ReadbackContext {
     // GPU BGRA->RGBA swizzle readback (format 3, WebRTC). Same size as BGRA; the swizzle runs on the GPU so the
     // main process never does the channel swap. Mirrors ReadbackConvert but outputs full-res RGBA.
     bool ReadbackRgba(ID3D11Texture2D* shared, uint32_t width, uint32_t height, std::vector<uint8_t>& out, std::string& err) {
+        InvalidateOn12OutBuffer();  // classic-staging consumer: never reuse an on12-wrapped outBuf
         if (!EnsureSwizzleShader()) { err = "swizzle shader init failed"; return false; }
         const size_t total = (size_t)width * 4 * height;
         if (!EnsureOutBuffer(total)) { err = "output buffer creation failed"; return false; }
@@ -455,13 +972,12 @@ struct ReadbackContext {
         return true;
     }
 
+    // Single-phase readback (mac/linux-style; Windows fallback + probe callers). Stays on the CLASSIC
+    // staging path for all formats — on the 11On12 device classic buffers/staging work unchanged; the
+    // Stage-2 READBACK-heap copy-out is wired only into the two-phase convert path (the NDI hot path).
     bool Readback(uintptr_t handle, uint32_t width, uint32_t height, int format, std::vector<uint8_t>& out, std::string& err) {
-        if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
-
         ComPtr<ID3D11Texture2D> shared;
-        HRESULT hr = device1->OpenSharedResource1(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
-        if (FAILED(hr)) hr = device->OpenSharedResource(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
-        if (FAILED(hr) || !shared) { err = "OpenSharedResource failed"; return false; }
+        if (!OpenSharedTex(handle, shared, err)) return false;
 
         ComPtr<IDXGIKeyedMutex> keyedMutex;
         bool haveKeyedMutex = SUCCEEDED(shared.As(&keyedMutex)) && keyedMutex;
@@ -490,8 +1006,12 @@ struct ReadbackContext {
         while (context->GetData(flushQuery.Get(), nullptr, 0, 0) != S_OK) std::this_thread::yield();
     }
 
-    // GPU-convert the shared texture into outStaging (no CPU read yet). Mirrors ReadbackConvert up to the copy.
-    bool ConvertToStaging(ID3D11Texture2D* shared, uint32_t width, uint32_t height, bool alpha, std::string& err) {
+    // GPU-convert the shared texture into outBuf (queues the compute dispatch only — no staging copy, no CPU
+    // read). Split out of ConvertToStaging so the Stage-2 D3D11On12 path (test/on12_harness.cc today, the
+    // readback_win 11On12 path in sub-step B) can run the EXACT same convert and then hand outBuf to the D3D12
+    // copy queue instead of the WC staging buffer. The live path below is unchanged: ConvertToStaging =
+    // DispatchConvert + the staging CopyResource, exactly as before.
+    bool DispatchConvert(ID3D11Texture2D* shared, uint32_t width, uint32_t height, bool alpha, std::string& err) {
         if (!EnsureShader()) { err = "compute shader init failed"; return false; }
         const size_t uyvySize = (size_t)width * 2 * height;
         const size_t total = alpha ? uyvySize + (size_t)width * height : uyvySize;
@@ -518,6 +1038,13 @@ struct ReadbackContext {
         ID3D11UnorderedAccessView* nullUav[] = { nullptr };
         context->CSSetShaderResources(0, 1, nullSrv);
         context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+        return true;
+    }
+
+    // GPU-convert the shared texture into outStaging (no CPU read yet). Mirrors ReadbackConvert up to the copy.
+    bool ConvertToStaging(ID3D11Texture2D* shared, uint32_t width, uint32_t height, bool alpha, std::string& err) {
+        InvalidateOn12OutBuffer();  // classic-staging consumer: never reuse an on12-wrapped outBuf
+        if (!DispatchConvert(shared, width, height, alpha, err)) return false;
         context->CopyResource(outStaging.Get(), outBuf.Get());
         return true;
     }
@@ -527,37 +1054,88 @@ struct ReadbackContext {
     // dstW/dstH > 0 additionally GPU-downscales the shared BGRA to a small buffer (for server/stage) in the
     // SAME GPU pass, so a mixed output reads back UYVY (NDI) + a few-MB scaled BGRA instead of the full frame.
     bool ConsumeShared(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH, std::string& err) {
-        if (!EnsureDevice()) { err = "D3D11CreateDevice failed"; return false; }
         ComPtr<ID3D11Texture2D> shared;
-        HRESULT hr = device1->OpenSharedResource1(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
-        if (FAILED(hr)) hr = device->OpenSharedResource(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(&shared));
-        if (FAILED(hr) || !shared) { err = "OpenSharedResource failed"; return false; }
+        if (!OpenSharedTex(handle, shared, err)) return false;
 
         ComPtr<IDXGIKeyedMutex> keyedMutex;
         bool haveKeyedMutex = SUCCEEDED(shared.As(&keyedMutex)) && keyedMutex;
         if (haveKeyedMutex && keyedMutex->AcquireSync(0, 1000) != S_OK) { err = "keyed mutex AcquireSync failed/timed out"; return false; }
 
         bool ok = true;
+        pendingOn12 = false;
         if (format == 1 || format == 2) {
             pendingIsConvert = true;
             const size_t uyvySize = (size_t)width * 2 * height;
             pendingTotal = (format == 2) ? uyvySize + (size_t)width * height : uyvySize;
-            ok = ConvertToStaging(shared.Get(), width, height, format == 2, err);
+            if (on12Active && EnsureOn12OutBuffer(pendingTotal)) {
+                // Stage-2 path: the UNCHANGED DispatchConvert (kConvertHLSL, same UAV desc) writes into the
+                // wrapped D3D12 buffer — EnsureOutBuffer inside it early-returns on the injected on12 pair.
+                pendingOn12 = true;
+                ID3D11Resource* wrapped[] = {outBuf.Get()};
+                on12->AcquireWrappedResources(wrapped, 1);
+                ok = DispatchConvert(shared.Get(), width, height, format == 2, err);
+                on12->ReleaseWrappedResources(wrapped, 1);
+            } else {
+                // classic WC-staging path — also the per-frame fallback when the on12 buffers can't be built
+                ok = ConvertToStaging(shared.Get(), width, height, format == 2, err);
+            }
         } else {
             // BGRA (multi-consumer / non-off-main): no split benefit; do the full read now into a vector.
             pendingIsConvert = false;
             ok = ReadbackBgra(shared.Get(), width, height, pendingBgra, err);
             pendingTotal = pendingBgra.size();
         }
-        // optional GPU downscale for server/stage, queued before the single WaitGpu below
+        // optional GPU downscale for server/stage, queued before the single GPU wait below (small WC copy-out;
+        // its D3D11 objects live on whichever device this context has — unchanged on 11On12)
         pendingScaledTotal = 0;
         if (ok && dstW > 0 && dstH > 0) {
             if (DownscaleToStaging(shared.Get(), width, height, dstW, dstH, err)) pendingScaledTotal = (size_t)dstW * dstH * 4;
             else ok = false;
         }
-        WaitGpu();  // ensure the GPU is done reading `shared` before it is released by the caller
+        // Ensure the GPU is done reading `shared` before the caller releases it.
+        if (on12Active) {
+            // Harness-proven single-device sequence: submit all queued 11On12 work to the DIRECT queue, fence
+            // it, and (convert path) queue the COPY-queue DMA into the READBACK heap NOW so it overlaps the
+            // caller's turnaround — its completion (pendingCopyFence) is waited in ReadPending. The CPU block
+            // here is an EVENT wait on the direct-queue fence — the WaitGpu busy-spin is gone on this path.
+            context->Flush();
+            const UINT64 vConv = ++d12FenceVal;
+            d12Direct->Signal(d12Fence.Get(), vConv);
+            if (ok && pendingOn12) {
+                d12Copy->Wait(d12Fence.Get(), vConv);
+                d12CopyAlloc->Reset();
+                d12CopyList->Reset(d12CopyAlloc.Get(), nullptr);
+                d12CopyList->CopyBufferRegion(rbBuf.Get(), 0, convBuf12.Get(), 0, pendingTotal);
+                d12CopyList->Close();
+                ID3D12CommandList* lists[] = {d12CopyList.Get()};
+                d12Copy->ExecuteCommandLists(1, lists);
+                pendingCopyFence = ++d12FenceVal;
+                d12Copy->Signal(d12Fence.Get(), pendingCopyFence);
+            }
+            if (!WaitFenceOn12(vConv, 2000)) {
+                ok = false;
+                if (err.empty()) err = "d3d11on12 convert fence watchdog";
+            }
+        } else {
+            WaitGpu();
+        }
         if (haveKeyedMutex) keyedMutex->ReleaseSync(0);
         return ok;
+    }
+
+    // SINGLE DISPATCH (plan §11 fix #1): the whole readback on this one context in one call — Consume (open +
+    // GPU-convert + WaitGpu, releasing the shared texture) then ReadPending (the slow copy-out) — with
+    // `onGpuDone` fired in between, the instant the GPU is done with the shared texture and the keyed mutex is
+    // released (identical release timing to the old two-phase Consume return), so the caller releases the
+    // Electron texture just as early WITHOUT a second N-API dispatch or the JS-loop hop between the phases.
+    bool ReadbackOnceOnCtx(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH,
+                           uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
+                           const std::function<void()>& onGpuDone, std::string& err) {
+        if (!ConsumeShared(handle, width, height, format, dstW, dstH, err)) return false;
+        // GPU has finished reading the shared texture and the keyed mutex is released -> safe to release the
+        // Electron texture now (before the slow copy-out below), exactly as the two-phase Consume did.
+        if (onGpuDone) onGpuDone();
+        return ReadPending(dst, dstSize, scaledDst, scaledSize, err);
     }
 
     // Phase 2: copy the pending result into `dst` (the slow WC/PCIe read for the convert path). When a GPU
@@ -567,6 +1145,16 @@ struct ReadbackContext {
         if (!pendingIsConvert) {
             std::memcpy(dst, pendingBgra.data(), n);
             pendingBgra.clear();
+        } else if (pendingOn12) {
+            // Stage-2 copy-out: wait the COPY-queue fence (event block; the DMA was queued in ConsumeShared so
+            // it overlapped the dispatch turnaround), then copy from the PERSISTENTLY-MAPPED CPU-cached
+            // READBACK heap. Routed through the same self-calibrating CopyPool as the WC path — the pool's
+            // [COPY-POOL] MB/s telemetry therefore shows the copy-out source speed directly (cached-class GB/s
+            // vs WC-class ~1.5 GB/s), and its knee-seeker re-calibrates to the cached regime on its own.
+            // (MOVNTDQA on WB/cached memory is an ordinary load — the NT hint only affects WC.)
+            if (!WaitFenceOn12(pendingCopyFence, 2000)) { err = "d3d11on12 copy fence watchdog"; return false; }
+            pendingCopyFence = 0;
+            ParallelStreamCopyFromWC(dst, rbPtr, n, 8);
         } else {
             D3D11_MAPPED_SUBRESOURCE map = {};
             if (FAILED(context->Map(outStaging.Get(), 0, D3D11_MAP_READ, 0, &map))) { err = "Map failed"; return false; }
@@ -664,6 +1252,59 @@ void ReadbackReleaseKey(const std::string& key) {
         ReleaseContext(it->second);
         g_pending.erase(it);
     }
+}
+
+// SINGLE-DISPATCH readback (plan §11 fix #1): borrow ONE context for the whole open+convert+wait+copy-out and
+// release it at the end — no g_pending map (the context never leaves this call), so two concurrent captures
+// for one output can't collide on a key and there is no cross-key cleanup path. `onGpuDone` fires once,
+// between the GPU wait and the copy-out, on this (worker) thread.
+bool ReadbackOnce(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH,
+                  uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
+                  const std::function<void()>& onGpuDone, std::string& err) {
+    ReadbackContext* ctx = AcquireContext();
+    bool ok = ctx->ReadbackOnceOnCtx(handle, width, height, format, dstW, dstH, dst, dstSize, scaledDst, scaledSize, onGpuDone, err);
+    ReleaseContext(ctx);
+    return ok;
+}
+
+unsigned CopyPoolActiveWorkers() { return CopyPool::Get().ActiveWorkers(); }
+
+// Stage-2 sub-step B telemetry ("observability, not knobs"): which copy-out backend the process is on.
+// "none" until the first device init; "d3d11" is authoritative once 11On12 is disabled (ladder fallback).
+const char* ReadbackBackend() {
+    if (g_on12Disabled.load()) return "d3d11";
+    switch (g_backendState.load()) {
+        case 1: return "d3d11on12";
+        case 2: return "d3d11";
+        default: return On12Allowed() ? "none" : "d3d11";
+    }
+}
+
+bool CopyPoolSelfTest(uint32_t bytes, uint32_t concurrency, uint32_t iterations, uint32_t& workers, uint32_t& mismatches, double& ms) {
+    std::atomic<uint32_t> mism{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<std::thread> callers;
+    for (uint32_t c = 0; c < concurrency; ++c) {
+        callers.emplace_back([&, c]() {
+            // 16-byte-aligned src (MOVNTDQA requires it), mirroring the real WC-mapped source.
+            std::vector<__m128i> srcAligned((bytes + 15) / 16);
+            uint8_t* src = reinterpret_cast<uint8_t*>(srcAligned.data());
+            std::vector<uint8_t> dst(bytes);
+            for (uint32_t i = 0; i < bytes; ++i) src[i] = static_cast<uint8_t>((i * 131u + c * 17u) & 0xffu);
+            for (uint32_t it = 0; it < iterations; ++it) {
+                std::memset(dst.data(), 0, bytes);
+                ParallelStreamCopyFromWC(dst.data(), src, bytes, 8);
+                if (std::memcmp(dst.data(), src, bytes) != 0) mism.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& th : callers) th.join();
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    mismatches = mism.load();
+    // Report the calibrated active_n AFTER the run (the converged value under this synthetic load). On
+    // cacheable RAM the VALUE is meaningless for WC/BAR sizing — the test only validates convergence behavior.
+    workers = CopyPool::Get().ActiveWorkers();
+    return mismatches == 0;
 }
 
 }  // namespace osrcap

@@ -239,6 +239,108 @@ private:
     Napi::Promise::Deferred deferred_;
 };
 
+// SINGLE-DISPATCH readback (plan §11 fix #1): one AsyncWorker runs the whole open+convert+WaitGpu+copy-out,
+// and fires the JS `onRelease` callback (the caller's releaseTexture) from INSIDE Execute — via a
+// ThreadSafeFunction — the instant the GPU is done with the shared texture, before the slow copy-out. This
+// keeps the early-release (frame-pool-drain) benefit of the old two-phase Consume while collapsing the two
+// N-API dispatches + the worker-JS-loop hop between them into ONE. Resolves to { main, scaled } when a GPU
+// downscale was requested, else just the main Buffer (same shape as FinishWorker).
+class ReadbackOnceWorker : public Napi::AsyncWorker {
+public:
+    ReadbackOnceWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, uint32_t dstW, uint32_t dstH,
+                       uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result,
+                       uint8_t* scaledDst, size_t scaledSize, bool hasScaled, Napi::Buffer<uint8_t> scaledResult,
+                       Napi::ThreadSafeFunction release, Napi::Promise::Deferred deferred)
+        : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), dstW_(dstW), dstH_(dstH),
+          dst_(dst), dstSize_(dstSize), resultRef_(Napi::Persistent(result)),
+          scaledDst_(scaledDst), scaledSize_(scaledSize), hasScaled_(hasScaled), release_(release), deferred_(deferred) {
+        if (hasScaled) scaledRef_ = Napi::Persistent(scaledResult);
+    }
+
+    void Execute() override {
+        std::string err;
+        // onGpuDone: fire the JS onRelease callback on the worker's JS loop (non-blocking is fine — it just
+        // posts releaseTexture to main). Guarded so it can only fire once even if the native layer were to
+        // call it twice. The TSFN keeps one live ref; it is Released in OnOK/OnError regardless.
+        bool released = false;
+        auto onGpuDone = [&]() {
+            if (released) return;
+            released = true;
+            release_.NonBlockingCall();
+        };
+        bool ok = osrcap::ReadbackOnce(handle_, w_, h_, format_, dstW_, dstH_, dst_, dstSize_,
+                                       scaledDst_, scaledSize_, onGpuDone, err);
+        // If the readback failed before the GPU wait, onGpuDone never fired; release the texture anyway so the
+        // caller's frame pool can't leak the shared texture (the JS side also has a finally safety-release).
+        if (!released) release_.NonBlockingCall();
+        if (!ok) SetError(err.empty() ? "readback failed" : err);
+    }
+
+    void OnOK() override {
+        Napi::HandleScope s(Env());
+        release_.Release();  // drop the TSFN ref (its callback is a no-op after this)
+        if (hasScaled_) {
+            Napi::Object o = Napi::Object::New(Env());
+            o.Set("main", resultRef_.Value());
+            o.Set("scaled", scaledRef_.Value());
+            deferred_.Resolve(o);
+        } else {
+            deferred_.Resolve(resultRef_.Value());
+        }
+    }
+    void OnError(const Napi::Error& e) override {
+        release_.Release();
+        deferred_.Reject(e.Value());
+    }
+
+private:
+    uintptr_t handle_;
+    uint32_t w_, h_;
+    int format_;
+    uint32_t dstW_, dstH_;
+    uint8_t* dst_;
+    size_t dstSize_;
+    Napi::Reference<Napi::Buffer<uint8_t>> resultRef_;
+    uint8_t* scaledDst_;
+    size_t scaledSize_;
+    bool hasScaled_;
+    Napi::Reference<Napi::Buffer<uint8_t>> scaledRef_;
+    Napi::ThreadSafeFunction release_;
+    Napi::Promise::Deferred deferred_;
+};
+
+// readbackOnce(source, w, h, format, key, dstW, dstH, onRelease) -> Promise<main | { main, scaled }>. `key`
+// selects this output's reused buffer pool (same as readbackFinish). `onRelease` is called (once) the moment
+// the GPU has consumed the shared texture, before the slow copy-out — the caller releases the Electron texture.
+Napi::Value ReadbackOnceJs(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uint32_t w = info[1].As<Napi::Number>().Uint32Value();
+    uint32_t h = info[2].As<Napi::Number>().Uint32Value();
+    int format = (info.Length() > 3 && info[3].IsNumber()) ? info[3].As<Napi::Number>().Int32Value() : 0;
+    std::string key = (info.Length() > 4 && info[4].IsString()) ? info[4].As<Napi::String>().Utf8Value() : std::string();
+    uint32_t dstW = (info.Length() > 5 && info[5].IsNumber()) ? info[5].As<Napi::Number>().Uint32Value() : 0;
+    uint32_t dstH = (info.Length() > 6 && info[6].IsNumber()) ? info[6].As<Napi::Number>().Uint32Value() : 0;
+    Napi::Function onRelease = info[7].As<Napi::Function>();
+
+    auto deferred = Napi::Promise::Deferred::New(env);
+    uintptr_t handle = 0;
+    Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
+    if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
+
+    size_t outSize = OutputSize(w, h, format);
+    Napi::Buffer<uint8_t> result = AcquireOutputBuffer(env, key, outSize);
+    bool hasScaled = dstW > 0 && dstH > 0;
+    size_t scaledSize = hasScaled ? (size_t)dstW * dstH * 4 : 0;
+    Napi::Buffer<uint8_t> scaledResult = hasScaled ? AcquireOutputBuffer(env, key + "#scaled", scaledSize) : Napi::Buffer<uint8_t>::New(env, 0);
+
+    // one-shot TSFN (initialThreadCount 1) so the worker thread can invoke onRelease on the JS loop mid-Execute.
+    Napi::ThreadSafeFunction release = Napi::ThreadSafeFunction::New(env, onRelease, "osrReadbackRelease", 0, 1);
+    (new ReadbackOnceWorker(env, handle, w, h, format, dstW, dstH, result.Data(), outSize, result,
+                            hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, release, deferred))
+        ->Queue();
+    return deferred.Promise();
+}
+
 Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     uint32_t w = info[1].As<Napi::Number>().Uint32Value();
@@ -276,6 +378,37 @@ Napi::Value ReadbackFinishJs(const Napi::CallbackInfo& info) {
     (new FinishWorker(env, std::move(key), result.Data(), outSize, result, hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, deferred))->Queue();
     return deferred.Promise();
 }
+
+// Stage-0 harness hook (Windows): _copyPoolSelfTest(bytes?, concurrency?, iterations?) -> { ok, mismatches,
+// workers, ms }. Runs synchronously on the caller (blocks); hangs only if the pool deadlocks. Dev-only.
+Napi::Value CopyPoolSelfTestJs(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    uint32_t bytes = (info.Length() > 0 && info[0].IsNumber()) ? info[0].As<Napi::Number>().Uint32Value() : (8u << 20);
+    uint32_t concurrency = (info.Length() > 1 && info[1].IsNumber()) ? info[1].As<Napi::Number>().Uint32Value() : 6;
+    uint32_t iterations = (info.Length() > 2 && info[2].IsNumber()) ? info[2].As<Napi::Number>().Uint32Value() : 200;
+    uint32_t workers = 0, mismatches = 0;
+    double ms = 0;
+    bool ok = osrcap::CopyPoolSelfTest(bytes, concurrency, iterations, workers, mismatches, ms);
+    Napi::Object o = Napi::Object::New(env);
+    o.Set("ok", Napi::Boolean::New(env, ok));
+    o.Set("mismatches", Napi::Number::New(env, mismatches));
+    o.Set("workers", Napi::Number::New(env, workers));
+    o.Set("ms", Napi::Number::New(env, ms));
+    return o;
+}
+
+// Copy-pool telemetry: the self-calibrated active worker count (knee-seeker base, plan §11 CV#1). Read-only —
+// there is deliberately NO setter and no env override; the pool sizes itself from measured throughput.
+Napi::Value CopyPoolActiveWorkersJs(const Napi::CallbackInfo& info) {
+    return Napi::Number::New(info.Env(), osrcap::CopyPoolActiveWorkers());
+}
+
+// Stage-2 sub-step B telemetry: the copy-out backend in use ("d3d11on12" | "d3d11" | "none"). Read-only —
+// the §5 ladder picks the backend (11On12 preferred, degrade on failure); FS_READBACK=d3d11 is the only
+// override and it is a binary diagnostic selector for A/B verification, not a tunable.
+Napi::Value ReadbackBackendJs(const Napi::CallbackInfo& info) {
+    return Napi::String::New(info.Env(), osrcap::ReadbackBackend());
+}
 #endif
 
 // Free a pool's reused buffers when its output is removed (else the per-output buffers leak for the process
@@ -310,8 +443,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("readback", Napi::Function::New(env, Readback));
     exports.Set("releasePool", Napi::Function::New(env, ReleasePool));
 #if defined(_WIN32)
+    exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
     exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
     exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
+    exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));
+    exports.Set("_copyPoolActiveWorkers", Napi::Function::New(env, CopyPoolActiveWorkersJs));
+    exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
 #endif
     osrcap::RegisterConvert(env, exports);
     return exports;

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -28,6 +29,34 @@ bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int forma
 bool ReadbackConsume(uintptr_t handle, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err);
 bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err);
 void ReadbackReleaseKey(const std::string& key);  // drop any pending consume for `key` (cleanup)
+
+// SINGLE-DISPATCH readback (plan §11 fix #1 — collapse the two-phase Consume/Finish into ONE N-API async op).
+// Runs the whole readback on one borrowed context in one Execute(): open + GPU-convert + WaitGpu + copy-out.
+// `onGpuDone` is invoked EXACTLY ONCE, on the SAME worker thread, the instant the GPU has finished reading the
+// shared texture (right after WaitGpu, BEFORE the slow PCIe copy-out) — so the caller releases the Electron
+// shared texture as EARLY as the old two-phase Consume did (frame-pool-drain protection preserved) without a
+// second dispatch+resume hop or the worker-JS-loop hop between the phases. `dst`/`scaledDst` are the caller's
+// V8 output buffers (filled here, off the JS thread). No `key`/pending map: the context is held for the whole
+// op and released at the end.
+bool ReadbackOnce(uintptr_t handle, uint32_t width, uint32_t height, int format, uint32_t dstW, uint32_t dstH,
+                  uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
+                  const std::function<void()>& onGpuDone, std::string& err);
+
+// Stage-0 harness for the global copy pool: hammer it with `concurrency` caller threads each doing
+// `iterations` copies of `bytes` through the pool, verifying each copy is byte-exact. Returns false (and
+// nonzero `mismatches`) on any corruption; hangs only if the pool deadlocks (that IS the test). `workers` =
+// the pool's CALIBRATED active worker count after the run (plan §11 CV#1 knee-seeker — on cacheable test
+// memory only its convergence matters, not the value); `ms` = wall time. No GPU/D3D — pure CPU validation.
+bool CopyPoolSelfTest(uint32_t bytes, uint32_t concurrency, uint32_t iterations, uint32_t& workers, uint32_t& mismatches, double& ms);
+
+// Telemetry (plan §11 CV#1 "observability, not knobs"): the copy pool's calibrated operating point
+// (`active_n` base). Exposed so FreeShow can log it alongside [SEND-STATS] for send-starvation attribution.
+unsigned CopyPoolActiveWorkers();
+
+// Stage-2 sub-step B telemetry: the copy-out backend in use — "d3d11on12" (D3D12 READBACK heap, cached
+// copy-out, copy-queue fence) or "d3d11" (classic WC staging + WaitGpu; also the §5-ladder fallback and the
+// FS_READBACK=d3d11 diagnostic selector), "none" before the first device init. Read-only — no setter.
+const char* ReadbackBackend();
 #endif
 
 #if defined(__linux__)
