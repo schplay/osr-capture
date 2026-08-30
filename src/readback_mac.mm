@@ -90,8 +90,11 @@ kernel void convertUyvy(texture2d<float, access::read> src [[texture(0)]],
 }
 
 // Box-filter downscale straight from the shared texture to a small tightly-packed BGRA buffer (server/stage
-// previews). Averages each destination pixel's source block — same integer block bounds as the CPU
-// downscaleBgra() and the Windows DSMain, so the three agree.
+// previews). Same integer block bounds as the CPU downscaleBgra(), the Windows DSMain and the Linux GLES3
+// pass. NOTE: like both of those GPU paths it accumulates in FLOAT and rounds (toByte), whereas the CPU
+// downscaleBgra() accumulates in integers and truncates — so GPU and CPU previews can differ by ±1 per
+// channel. That is the pre-existing convention on all three GPU backends, kept here deliberately so the
+// three GPU paths agree with each other; the convert kernels above ARE byte-identical to the CPU converter.
 kernel void downscaleBgra(texture2d<float, access::read> src [[texture(0)]],
                           device uint* dst [[buffer(0)]],
                           constant DsParams& p [[buffer(1)]],
