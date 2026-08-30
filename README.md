@@ -22,7 +22,7 @@ Built for FreeShow (https://github.com/ChurchApps/FreeShow), but generic.
 | --- | --- | --- |
 | Windows | Direct3D 11 (`OpenSharedResource` + staging texture) | Implemented & validated |
 | macOS | IOSurface (`IOSurfaceLock` + row copy) | Implemented — needs testing on macOS |
-| Linux | dmabuf `mmap` (LINEAR modifier) | Implemented for linear buffers — needs testing; **tiled/compressed modifiers require an EGL `EGL_LINUX_DMA_BUF_EXT` → `glReadPixels` GPU-import path (TODO)** |
+| Linux | GPU readback (EGL dmabuf import + GLES3 convert), CPU dmabuf `mmap` fallback | Implemented — the GPU path handles tiled/compressed modifiers and converts on the GPU (reads back the converted output instead of raw BGRA, far faster); when EGL/dmabuf import is unavailable it falls back automatically to a per-frame CPU `mmap` (LINEAR modifier only). The two-phase API is available on Linux when the GPU path initialized (feature-detect via presence of `readbackConsume`, same as Windows) |
 
 Where the addon fails to load or a readback isn't supported for the given frame, callers should fall back
 to CPU-mode offscreen capture.
@@ -70,10 +70,16 @@ Notes:
 - Readbacks are serialized internally (single D3D11 device/context); throttle to your target frame rate and
   keep at most one readback per surface in flight.
 
+### Diagnostics (Linux)
+
+Set `FS_LINUX_READBACK=cpu` to force the CPU `mmap` fallback (bypassing the GPU path), and
+`FS_LINUX_READBACK_FLIP=1` to flip rows if your driver delivers frames upside-down.
+
 ## Build
 
 Native addon (node-gyp + `node-addon-api`). Requires a C++17 toolchain and the Windows SDK (`d3d11.h`,
-`dxgi1_2.h`).
+`dxgi1_2.h`). On Linux, building needs `libegl1-mesa-dev` and `libgles2-mesa-dev`; at runtime the addon
+links against `libegl1` and `libgles2`.
 
 Against Node:
 

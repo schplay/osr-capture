@@ -18,10 +18,11 @@ declare module "osr-capture" {
      * - `2` UYVA — UYVY plane `width * 2 * height` + full-res alpha plane `width * height` (NDI with alpha).
      * - `3` RGBA — tightly-packed `width * 4 * height` (BGRA with R/B swapped; e.g. WebRTC's ImageData).
      *
-     * On Windows the conversion/swizzle is done on the GPU (D3D11 compute shader) during readback. On
-     * macOS/Linux it is a CPU convert applied to the BGRA readback (BT.601 full range for 1/2, channel swap for
-     * 3); the reduced/native format still avoids a per-frame CPU convert on the app's main thread. A GPU convert
-     * on macOS (Metal) / Linux (EGL/GL) is future work.
+     * On Windows the conversion/swizzle is done on the GPU (D3D11 compute shader) during readback. On Linux it
+     * is done on the GPU too (EGL dmabuf import + GLES3 fragment shaders) when the
+     * headless EGL path initialized, falling back to a CPU convert of the mmap'd LINEAR dmabuf otherwise. On
+     * macOS it is a CPU convert applied to the BGRA readback (BT.601 full range for 1/2, channel swap for 3);
+     * a GPU convert on macOS (Metal) is future work.
      */
     export type ReadbackFormat = 0 | 1 | 2 | 3
 
@@ -45,7 +46,8 @@ declare module "osr-capture" {
     export function releasePool(poolKey: string): void
 
     /**
-     * Two-phase readback (WINDOWS ONLY). Splits {@link readback} so the caller can release the Electron shared
+     * Two-phase readback (Windows always; Linux when the GPU readback path initialized — the export is ABSENT
+     * on Linux otherwise, and on macOS). Splits {@link readback} so the caller can release the Electron shared
      * texture as soon as the GPU has consumed it, instead of pinning it for the whole (slow) PCIe read-back —
      * which otherwise drains Electron's compositor frame pool.
      *
@@ -59,14 +61,14 @@ declare module "osr-capture" {
     export function readbackConsume(source: Buffer | DmabufInfo, width: number, height: number, format: ReadbackFormat, poolKey: string, dstWidth?: number, dstHeight?: number): Promise<void>
 
     /**
-     * Phase 2 of the two-phase readback (WINDOWS ONLY). Copies the consumed frame out. Resolves the converted
+     * Phase 2 of the two-phase readback (Windows / Linux-GPU, see {@link readbackConsume}). Copies the consumed frame out. Resolves the converted
      * `Buffer` when no downscale was requested, or `{ main, scaled }` when `dstWidth`/`dstHeight` were given to
      * {@link readbackConsume} (`main` = the `format` buffer, `scaled` = `dstWidth * dstHeight * 4` BGRA).
      */
     export function readbackFinish(poolKey: string, width: number, height: number, format?: ReadbackFormat, dstWidth?: number, dstHeight?: number): Promise<Buffer | { main: Buffer; scaled: Buffer }>
 
     /**
-     * SINGLE-DISPATCH readback (WINDOWS ONLY) — the collapse of {@link readbackConsume} + {@link readbackFinish}
+     * SINGLE-DISPATCH readback (Windows / Linux-GPU) — the collapse of {@link readbackConsume} + {@link readbackFinish}
      * into ONE N-API async op (plan §11 fix #1). Runs open + GPU-convert + GPU-wait + copy-out in one worker
      * dispatch and calls `onRelease` EXACTLY ONCE, the instant the GPU has consumed the shared texture (before
      * the slow copy-out) — so the caller releases the Electron texture just as early as two-phase, without the

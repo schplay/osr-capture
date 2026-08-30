@@ -66,7 +66,30 @@ struct DmabufPlane {
     uint64_t offset;
     uint64_t size;
 };
-bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, std::vector<uint8_t>& out, std::string& err);
+// Single-phase readback. GPU (EGL dmabuf import + shader convert, any modifier) when available, else the
+// mmap+CPU path (LINEAR only). `poolKey` (may be empty) keys the GPU path's cached FBO/PBO per output.
+bool ReadbackDmabuf(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& poolKey, std::vector<uint8_t>& out, std::string& err);
+
+// One-time init of the Linux GPU (EGL/GLES3) readback; true when the two-phase exports should be
+// installed. Idempotent, thread-safe (called from every env's addon Init). See LINUX_GPU_READBACK.md.
+bool LinuxGpuReadbackInit();
+
+// Two-phase readback (Linux flavour of the Windows contract above): Consume imports the dmabuf, runs the
+// GPU convert (+ dstW/dstH downscale) and returns once the GPU has finished READING the dmabuf — the
+// caller releases the Electron texture then. Finish waits the async PBO readback and copies out. A `key`
+// may have at most one consume outstanding at a time. When a frame's GPU import fails, consume falls
+// back to the CPU path internally (LINEAR only) so the contract holds either way.
+bool ReadbackConsume(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH, std::string& err);
+bool ReadbackFinish(const std::string& key, uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize, std::string& err);
+void ReadbackReleaseKey(const std::string& key);  // drop pending state + cached GL resources for `key`
+
+// Single-dispatch readback (parity with the Windows ReadbackOnce): consume + onGpuDone + finish.
+bool ReadbackOnce(const std::vector<DmabufPlane>& planes, uint64_t modifier, uint32_t width, uint32_t height, int format, const std::string& key, uint32_t dstW, uint32_t dstH,
+                  uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
+                  const std::function<void()>& onGpuDone, std::string& err);
+
+// Telemetry: "egl-gles3" (GPU path active), "cpu" (unavailable/forced/demoted), "none" (before init).
+const char* ReadbackBackend();
 #endif
 
 }  // namespace osrcap

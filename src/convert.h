@@ -22,4 +22,8 @@ void ConvertBgraToUyvaRaw(const uint8_t* bgra, uint32_t width, uint32_t height, 
 // false is returned (caller keeps the BGRA).
 bool ConvertBgraInPlace(std::vector<uint8_t>& buf, uint32_t width, uint32_t height, int format);
 
+// Box-filter downscale of tightly-packed BGRA (srcW*srcH*4) into `out` (dstW*dstH*4). Shared by the
+// N-API downscaleBgra export and the Linux CPU-fallback consume (which mirrors the GPU downscale).
+void DownscaleBgraRaw(const uint8_t* src, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::vector<uint8_t>& out);
+
 }  // namespace osrcap

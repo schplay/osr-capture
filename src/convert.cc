@@ -123,19 +123,11 @@ Napi::Value ConvertBgraToUyva(const Napi::CallbackInfo& info) {
 // pixel's source block — reads the whole source once (memory-bound, ~10-30ms at 4K), which is an order of
 // magnitude cheaper than a 4K nativeImage.resize on the JS main thread (~200ms). Used so server/stage/preview
 // consumers get a small image without pinning the main thread.
-Napi::Value DownscaleBgra(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
-    uint32_t srcW = info[1].As<Napi::Number>().Uint32Value();
-    uint32_t srcH = info[2].As<Napi::Number>().Uint32Value();
-    uint32_t dstW = info[3].As<Napi::Number>().Uint32Value();
-    uint32_t dstH = info[4].As<Napi::Number>().Uint32Value();
+void DownscaleBgraRaw(const uint8_t* s, uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH, std::vector<uint8_t>& out) {
     if (dstW < 1) dstW = 1;
     if (dstH < 1) dstH = 1;
-
-    const uint8_t* s = src.Data();
-    Napi::Buffer<uint8_t> out = Napi::Buffer<uint8_t>::New(env, static_cast<size_t>(dstW) * dstH * 4);
-    uint8_t* d = out.Data();
+    out.resize(static_cast<size_t>(dstW) * dstH * 4);
+    uint8_t* d = out.data();
 
     for (uint32_t dy = 0; dy < dstH; ++dy) {
         uint32_t sy0 = static_cast<uint32_t>(static_cast<uint64_t>(dy) * srcH / dstH);
@@ -166,7 +158,19 @@ Napi::Value DownscaleBgra(const Napi::CallbackInfo& info) {
             o[3] = static_cast<uint8_t>(a / cnt);
         }
     }
-    return out;
+}
+
+Napi::Value DownscaleBgra(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    Napi::Buffer<uint8_t> src = info[0].As<Napi::Buffer<uint8_t>>();
+    uint32_t srcW = info[1].As<Napi::Number>().Uint32Value();
+    uint32_t srcH = info[2].As<Napi::Number>().Uint32Value();
+    uint32_t dstW = info[3].As<Napi::Number>().Uint32Value();
+    uint32_t dstH = info[4].As<Napi::Number>().Uint32Value();
+
+    std::vector<uint8_t> out;
+    DownscaleBgraRaw(src.Data(), srcW, srcH, dstW, dstH, out);
+    return Napi::Buffer<uint8_t>::Copy(env, out.data(), out.size());
 }
 
 void RegisterConvert(Napi::Env env, Napi::Object exports) {

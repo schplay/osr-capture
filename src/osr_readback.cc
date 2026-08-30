@@ -47,14 +47,44 @@ struct AddonData {
     std::map<std::string, BufferPool> pools;
 };
 
+#if defined(__linux__)
+// Parse the Linux `source` shape ({ planes: {fd,stride,offset,size}[], modifier }) shared by readback /
+// readbackConsume / readbackOnce.
+void ParseLinuxSource(Napi::Value src, std::vector<osrcap::DmabufPlane>& planes, uint64_t& modifier) {
+    planes.clear();
+    modifier = 0;
+    if (!src.IsObject()) return;
+    Napi::Object arg = src.As<Napi::Object>();
+    if (arg.Get("planes").IsArray()) {
+        Napi::Array arr = arg.Get("planes").As<Napi::Array>();
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+            Napi::Object p = arr.Get(i).As<Napi::Object>();
+            osrcap::DmabufPlane dp;
+            dp.fd = p.Get("fd").As<Napi::Number>().Int32Value();
+            dp.stride = p.Get("stride").As<Napi::Number>().Uint32Value();
+            dp.offset = static_cast<uint64_t>(p.Get("offset").As<Napi::Number>().Int64Value());
+            dp.size = static_cast<uint64_t>(p.Get("size").As<Napi::Number>().Int64Value());
+            planes.push_back(dp);
+        }
+    }
+    Napi::Value mod = arg.Get("modifier");
+    if (mod.IsBigInt()) {
+        bool lossless = false;
+        modifier = mod.As<Napi::BigInt>().Uint64Value(&lossless);
+    } else if (mod.IsNumber()) {
+        modifier = static_cast<uint64_t>(mod.As<Napi::Number>().Int64Value());
+    }
+}
+#endif
+
 class ReadbackWorker : public Napi::AsyncWorker {
 public:
 #if defined(_WIN32) || defined(__APPLE__)
     ReadbackWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result, Napi::Promise::Deferred deferred)
         : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), dst_(dst), dstSize_(dstSize), resultRef_(Napi::Persistent(result)), deferred_(deferred) {}
 #elif defined(__linux__)
-    ReadbackWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result, Napi::Promise::Deferred deferred)
-        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), dst_(dst), dstSize_(dstSize), resultRef_(Napi::Persistent(result)), deferred_(deferred) {}
+    ReadbackWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string poolKey, uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result, Napi::Promise::Deferred deferred)
+        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), poolKey_(std::move(poolKey)), w_(w), h_(h), format_(format), dst_(dst), dstSize_(dstSize), resultRef_(Napi::Persistent(result)), deferred_(deferred) {}
 #endif
 
     void Execute() override {
@@ -63,7 +93,7 @@ public:
 #if defined(_WIN32) || defined(__APPLE__)
         ok = osrcap::ReadbackHandle(handle_, w_, h_, format_, out_, err);
 #elif defined(__linux__)
-        ok = osrcap::ReadbackDmabuf(planes_, modifier_, w_, h_, format_, out_, err);
+        ok = osrcap::ReadbackDmabuf(planes_, modifier_, w_, h_, format_, poolKey_, out_, err);
 #else
         err = "unsupported platform";
 #endif
@@ -93,6 +123,7 @@ private:
 #elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes_;
     uint64_t modifier_ = 0;
+    std::string poolKey_;
 #endif
     uint32_t w_ = 0;
     uint32_t h_ = 0;
@@ -144,29 +175,10 @@ Napi::Value Readback(const Napi::CallbackInfo& info) {
     if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     (new ReadbackWorker(env, handle, w, h, format, dst, outSize, result, deferred))->Queue();
 #elif defined(__linux__)
-    Napi::Object arg = info[0].As<Napi::Object>();
     std::vector<osrcap::DmabufPlane> planes;
-    if (arg.Get("planes").IsArray()) {
-        Napi::Array arr = arg.Get("planes").As<Napi::Array>();
-        for (uint32_t i = 0; i < arr.Length(); ++i) {
-            Napi::Object p = arr.Get(i).As<Napi::Object>();
-            osrcap::DmabufPlane dp;
-            dp.fd = p.Get("fd").As<Napi::Number>().Int32Value();
-            dp.stride = p.Get("stride").As<Napi::Number>().Uint32Value();
-            dp.offset = static_cast<uint64_t>(p.Get("offset").As<Napi::Number>().Int64Value());
-            dp.size = static_cast<uint64_t>(p.Get("size").As<Napi::Number>().Int64Value());
-            planes.push_back(dp);
-        }
-    }
     uint64_t modifier = 0;
-    Napi::Value mod = arg.Get("modifier");
-    if (mod.IsBigInt()) {
-        bool lossless = false;
-        modifier = mod.As<Napi::BigInt>().Uint64Value(&lossless);
-    } else if (mod.IsNumber()) {
-        modifier = static_cast<uint64_t>(mod.As<Napi::Number>().Int64Value());
-    }
-    (new ReadbackWorker(env, std::move(planes), modifier, w, h, format, dst, outSize, result, deferred))->Queue();
+    ParseLinuxSource(info[0], planes, modifier);
+    (new ReadbackWorker(env, std::move(planes), modifier, w, h, format, poolKey, dst, outSize, result, deferred))->Queue();
 #else
     deferred.Reject(Napi::Error::New(env, "unsupported platform").Value());
 #endif
@@ -174,17 +186,28 @@ Napi::Value Readback(const Napi::CallbackInfo& info) {
     return deferred.Promise();
 }
 
-#if defined(_WIN32)
-// Two-phase readback (Windows): consume opens+GPU-converts the shared texture and returns once the GPU has
-// read it (so the caller can release the Electron texture); finish does the slow PCIe copy into a pooled
-// buffer. This keeps the shared texture pinned only for the GPU phase, not the whole readback.
+#if defined(_WIN32) || defined(__linux__)
+// Two-phase readback (Windows + Linux-GPU): consume opens+GPU-converts the shared texture / imported
+// dmabuf and returns once the GPU has read it (so the caller can release the Electron texture); finish
+// does the slow copy into a pooled buffer. This keeps the shared texture pinned only for the GPU phase,
+// not the whole readback.
 class ConsumeWorker : public Napi::AsyncWorker {
 public:
+#if defined(_WIN32)
     ConsumeWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, Napi::Promise::Deferred deferred)
         : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), deferred_(deferred) {}
+#else
+    ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, Napi::Promise::Deferred deferred)
+        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), deferred_(deferred) {}
+#endif
     void Execute() override {
         std::string err;
-        if (!osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, err)) SetError(err.empty() ? "consume failed" : err);
+#if defined(_WIN32)
+        bool ok = osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, err);
+#else
+        bool ok = osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, err);
+#endif
+        if (!ok) SetError(err.empty() ? "consume failed" : err);
     }
     void OnOK() override {
         Napi::HandleScope s(Env());
@@ -193,7 +216,12 @@ public:
     void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
 
 private:
+#if defined(_WIN32)
     uintptr_t handle_;
+#else
+    std::vector<osrcap::DmabufPlane> planes_;
+    uint64_t modifier_ = 0;
+#endif
     uint32_t w_, h_;
     int format_;
     std::string key_;
@@ -247,6 +275,7 @@ private:
 // downscale was requested, else just the main Buffer (same shape as FinishWorker).
 class ReadbackOnceWorker : public Napi::AsyncWorker {
 public:
+#if defined(_WIN32)
     ReadbackOnceWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, uint32_t dstW, uint32_t dstH,
                        uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result,
                        uint8_t* scaledDst, size_t scaledSize, bool hasScaled, Napi::Buffer<uint8_t> scaledResult,
@@ -256,6 +285,17 @@ public:
           scaledDst_(scaledDst), scaledSize_(scaledSize), hasScaled_(hasScaled), release_(release), deferred_(deferred) {
         if (hasScaled) scaledRef_ = Napi::Persistent(scaledResult);
     }
+#else
+    ReadbackOnceWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH,
+                       uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result,
+                       uint8_t* scaledDst, size_t scaledSize, bool hasScaled, Napi::Buffer<uint8_t> scaledResult,
+                       Napi::ThreadSafeFunction release, Napi::Promise::Deferred deferred)
+        : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), key_(std::move(key)), w_(w), h_(h), format_(format), dstW_(dstW), dstH_(dstH),
+          dst_(dst), dstSize_(dstSize), resultRef_(Napi::Persistent(result)),
+          scaledDst_(scaledDst), scaledSize_(scaledSize), hasScaled_(hasScaled), release_(release), deferred_(deferred) {
+        if (hasScaled) scaledRef_ = Napi::Persistent(scaledResult);
+    }
+#endif
 
     void Execute() override {
         std::string err;
@@ -268,8 +308,13 @@ public:
             released = true;
             release_.NonBlockingCall();
         };
+#if defined(_WIN32)
         bool ok = osrcap::ReadbackOnce(handle_, w_, h_, format_, dstW_, dstH_, dst_, dstSize_,
                                        scaledDst_, scaledSize_, onGpuDone, err);
+#else
+        bool ok = osrcap::ReadbackOnce(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, dst_, dstSize_,
+                                       scaledDst_, scaledSize_, onGpuDone, err);
+#endif
         // If the readback failed before the GPU wait, onGpuDone never fired; release the texture anyway so the
         // caller's frame pool can't leak the shared texture (the JS side also has a finally safety-release).
         if (!released) release_.NonBlockingCall();
@@ -294,7 +339,13 @@ public:
     }
 
 private:
+#if defined(_WIN32)
     uintptr_t handle_;
+#else
+    std::vector<osrcap::DmabufPlane> planes_;
+    uint64_t modifier_ = 0;
+    std::string key_;
+#endif
     uint32_t w_, h_;
     int format_;
     uint32_t dstW_, dstH_;
@@ -323,10 +374,6 @@ Napi::Value ReadbackOnceJs(const Napi::CallbackInfo& info) {
     Napi::Function onRelease = info[7].As<Napi::Function>();
 
     auto deferred = Napi::Promise::Deferred::New(env);
-    uintptr_t handle = 0;
-    Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
-    if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
-
     size_t outSize = OutputSize(w, h, format);
     Napi::Buffer<uint8_t> result = AcquireOutputBuffer(env, key, outSize);
     bool hasScaled = dstW > 0 && dstH > 0;
@@ -335,9 +382,21 @@ Napi::Value ReadbackOnceJs(const Napi::CallbackInfo& info) {
 
     // one-shot TSFN (initialThreadCount 1) so the worker thread can invoke onRelease on the JS loop mid-Execute.
     Napi::ThreadSafeFunction release = Napi::ThreadSafeFunction::New(env, onRelease, "osrReadbackRelease", 0, 1);
+#if defined(_WIN32)
+    uintptr_t handle = 0;
+    Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
+    if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     (new ReadbackOnceWorker(env, handle, w, h, format, dstW, dstH, result.Data(), outSize, result,
                             hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, release, deferred))
         ->Queue();
+#else
+    std::vector<osrcap::DmabufPlane> planes;
+    uint64_t modifier = 0;
+    ParseLinuxSource(info[0], planes, modifier);
+    (new ReadbackOnceWorker(env, std::move(planes), modifier, w, h, format, key, dstW, dstH, result.Data(), outSize, result,
+                            hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, release, deferred))
+        ->Queue();
+#endif
     return deferred.Promise();
 }
 
@@ -351,10 +410,17 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
     uint32_t dstW = (info.Length() > 5 && info[5].IsNumber()) ? info[5].As<Napi::Number>().Uint32Value() : 0;
     uint32_t dstH = (info.Length() > 6 && info[6].IsNumber()) ? info[6].As<Napi::Number>().Uint32Value() : 0;
     auto deferred = Napi::Promise::Deferred::New(env);
+#if defined(_WIN32)
     uintptr_t handle = 0;
     Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
     if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, deferred))->Queue();
+#else
+    std::vector<osrcap::DmabufPlane> planes;
+    uint64_t modifier = 0;
+    ParseLinuxSource(info[0], planes, modifier);
+    (new ConsumeWorker(env, std::move(planes), modifier, w, h, format, std::move(key), dstW, dstH, deferred))->Queue();
+#endif
     return deferred.Promise();
 }
 
@@ -379,6 +445,7 @@ Napi::Value ReadbackFinishJs(const Napi::CallbackInfo& info) {
     return deferred.Promise();
 }
 
+#if defined(_WIN32)
 // Stage-0 harness hook (Windows): _copyPoolSelfTest(bytes?, concurrency?, iterations?) -> { ok, mismatches,
 // workers, ms }. Runs synchronously on the caller (blocks); hangs only if the pool deadlocks. Dev-only.
 Napi::Value CopyPoolSelfTestJs(const Napi::CallbackInfo& info) {
@@ -402,10 +469,11 @@ Napi::Value CopyPoolSelfTestJs(const Napi::CallbackInfo& info) {
 Napi::Value CopyPoolActiveWorkersJs(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), osrcap::CopyPoolActiveWorkers());
 }
+#endif
 
-// Stage-2 sub-step B telemetry: the copy-out backend in use ("d3d11on12" | "d3d11" | "none"). Read-only —
-// the §5 ladder picks the backend (11On12 preferred, degrade on failure); FS_READBACK=d3d11 is the only
-// override and it is a binary diagnostic selector for A/B verification, not a tunable.
+// Backend telemetry. Windows (Stage-2 sub-step B): the copy-out backend in use ("d3d11on12" | "d3d11" |
+// "none") — the §5 ladder picks it; FS_READBACK=d3d11 is a binary diagnostic selector, not a tunable.
+// Linux: "egl-gles3" (GPU readback active) | "cpu" (unavailable/forced/demoted) | "none". Read-only.
 Napi::Value ReadbackBackendJs(const Napi::CallbackInfo& info) {
     return Napi::String::New(info.Env(), osrcap::ReadbackBackend());
 }
@@ -422,7 +490,7 @@ Napi::Value ReleasePool(const Napi::CallbackInfo& info) {
             data->pools.erase(key);
             data->pools.erase(key + "#scaled");
         }
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__linux__)
         osrcap::ReadbackReleaseKey(key);
 #endif
     }
@@ -448,6 +516,16 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
     exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));
     exports.Set("_copyPoolActiveWorkers", Napi::Function::New(env, CopyPoolActiveWorkersJs));
+    exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
+#elif defined(__linux__)
+    // The two-phase/once exports are installed ONLY when the GPU (EGL/GLES3) path initialized — FreeShow
+    // keys off `typeof readbackConsume === "function"` (ndiWorker two-phase preference, OutputLifecycle
+    // hasGpuDownscale) and must fall back to single-phase `readback` when only the CPU path exists.
+    if (osrcap::LinuxGpuReadbackInit()) {
+        exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
+        exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
+        exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
+    }
     exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
 #endif
     osrcap::RegisterConvert(env, exports);
