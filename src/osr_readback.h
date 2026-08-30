@@ -10,16 +10,25 @@
 
 namespace osrcap {
 
-// format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (colour + alpha). Only Windows honours 1/2 (GPU
-// convert); mac/linux produce BGRA regardless, so callers request 0 there.
+// format: 0 = BGRA (raw), 1 = UYVY (opaque), 2 = UYVA (colour + alpha), 3 = RGBA (swizzle). All three
+// platforms convert on the GPU — Windows HLSL compute, macOS Metal compute, Linux GLES3 shader — and each
+// falls back to the CPU converter only when its GPU path is unavailable for the device or the frame.
 #if defined(_WIN32) || defined(__APPLE__)
 // Windows: `handle` is a HANDLE to the shared D3D11 texture.
 // macOS:   `handle` is an IOSurface* (valid in this process).
 bool ReadbackHandle(uintptr_t handle, uint32_t width, uint32_t height, int format, std::vector<uint8_t>& out, std::string& err);
 #endif
 
-#if defined(_WIN32)
-// Two-phase readback (Windows), so the CALLER can release the Electron shared texture as soon as the GPU has
+#if defined(__APPLE__)
+// One-time init of the macOS GPU (Metal) readback; true when the two-phase exports should be installed.
+// Idempotent, thread-safe (called from every env's addon Init). Mirrors LinuxGpuReadbackInit below: with no
+// Metal device the exports stay absent and FreeShow's `typeof readbackConsume === "function"` probe keeps it
+// on the single-phase `readback`, which then uses the CPU IOSurface path.
+bool MacGpuReadbackInit();
+#endif
+
+#if defined(_WIN32) || defined(__APPLE__)
+// Two-phase readback (Windows/macOS), so the CALLER can release the Electron shared texture as soon as the GPU has
 // consumed it — instead of pinning it for the whole (slow) PCIe read-back, which drains Electron's frame pool
 // and stalls the main process. Consume: open the shared texture, GPU-convert into an internal buffer keyed by
 // `key`, and return only once the GPU has finished reading the shared texture. Finish: copy that buffer to
@@ -42,6 +51,7 @@ bool ReadbackOnce(uintptr_t handle, uint32_t width, uint32_t height, int format,
                   uint8_t* dst, size_t dstSize, uint8_t* scaledDst, size_t scaledSize,
                   const std::function<void()>& onGpuDone, std::string& err);
 
+#if defined(_WIN32)
 // Stage-0 harness for the global copy pool: hammer it with `concurrency` caller threads each doing
 // `iterations` copies of `bytes` through the pool, verifying each copy is byte-exact. Returns false (and
 // nonzero `mismatches`) on any corruption; hangs only if the pool deadlocks (that IS the test). `workers` =
@@ -52,12 +62,16 @@ bool CopyPoolSelfTest(uint32_t bytes, uint32_t concurrency, uint32_t iterations,
 // Telemetry (plan §11 CV#1 "observability, not knobs"): the copy pool's calibrated operating point
 // (`active_n` base). Exposed so FreeShow can log it alongside [SEND-STATS] for send-starvation attribution.
 unsigned CopyPoolActiveWorkers();
+#endif  // _WIN32 (copy-pool harness/telemetry)
 
-// Stage-2 sub-step B telemetry: the copy-out backend in use — "d3d11on12" (D3D12 READBACK heap, cached
-// copy-out, copy-queue fence) or "d3d11" (classic WC staging + WaitGpu; also the §5-ladder fallback and the
-// FS_READBACK=d3d11 diagnostic selector), "none" before the first device init. Read-only — no setter.
+// Telemetry: the readback backend actually in use. Read-only — no setter.
+//   Windows: "d3d11on12" (D3D12 READBACK heap, cached copy-out, copy-queue fence) or "d3d11" (classic WC
+//            staging + WaitGpu; also the §5-ladder fallback and the FS_READBACK=d3d11 diagnostic selector).
+//   macOS:   "metal" (IOSurface wrapped zero-copy as an MTLTexture, compute convert/downscale) or
+//            "iosurface-cpu" (no Metal device / non-BGRA surface / unsupported width).
+//   "none" before the first device init.
 const char* ReadbackBackend();
-#endif
+#endif  // _WIN32 || __APPLE__
 
 #if defined(__linux__)
 struct DmabufPlane {

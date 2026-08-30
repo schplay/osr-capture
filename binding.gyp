@@ -26,7 +26,16 @@
                         "xcode_settings": {
                             "CLANG_CXX_LANGUAGE_STANDARD": "c++17",
                             "GCC_ENABLE_CPP_EXCEPTIONS": "YES",
-                            "OTHER_LDFLAGS": ["-framework IOSurface", "-framework CoreFoundation"]
+                            # ARC for the Metal backend: it holds id<MTLBuffer>/id<MTLTexture> in C++
+                            # containers, which manual retain/release would make error-prone. CF types
+                            # (IOSurfaceRef) are unaffected and stay manually managed.
+                            "CLANG_ENABLE_OBJC_ARC": "YES",
+                            "OTHER_LDFLAGS": [
+                                "-framework IOSurface",
+                                "-framework CoreFoundation",
+                                "-framework Foundation",
+                                "-framework Metal"
+                            ]
                         }
                     }
                 ],

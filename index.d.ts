@@ -18,11 +18,12 @@ declare module "osr-capture" {
      * - `2` UYVA — UYVY plane `width * 2 * height` + full-res alpha plane `width * height` (NDI with alpha).
      * - `3` RGBA — tightly-packed `width * 4 * height` (BGRA with R/B swapped; e.g. WebRTC's ImageData).
      *
-     * On Windows the conversion/swizzle is done on the GPU (D3D11 compute shader) during readback. On Linux it
-     * is done on the GPU too (EGL dmabuf import + GLES3 fragment shaders) when the
-     * headless EGL path initialized, falling back to a CPU convert of the mmap'd LINEAR dmabuf otherwise. On
-     * macOS it is a CPU convert applied to the BGRA readback (BT.601 full range for 1/2, channel swap for 3);
-     * a GPU convert on macOS (Metal) is future work.
+     * The conversion/swizzle is done on the GPU during readback on every platform. Windows: a D3D11 compute
+     * shader. macOS: a Metal compute kernel reading the IOSurface wrapped zero-copy as an MTLTexture, falling
+     * back to a CPU convert of the locked surface when there is no Metal device (or the surface is not BGRA /
+     * the width is not a multiple of 4). Linux: EGL dmabuf import + GLES3 fragment shaders when the headless
+     * EGL path initialized, falling back to a CPU convert of the mmap'd LINEAR dmabuf otherwise. All paths
+     * produce identical bytes (BT.601 full range for 1/2, channel swap for 3).
      */
     export type ReadbackFormat = 0 | 1 | 2 | 3
 
@@ -46,9 +47,10 @@ declare module "osr-capture" {
     export function releasePool(poolKey: string): void
 
     /**
-     * Two-phase readback (Windows always; Linux when the GPU readback path initialized — the export is ABSENT
-     * on Linux otherwise, and on macOS). Splits {@link readback} so the caller can release the Electron shared
-     * texture as soon as the GPU has consumed it, instead of pinning it for the whole (slow) PCIe read-back —
+     * Two-phase readback (Windows always; macOS when a Metal device exists; Linux when the GPU readback path
+     * initialized — the export is ABSENT otherwise, so callers can feature-detect with
+     * `typeof readbackConsume === "function"`). Splits {@link readback} so the caller can release the Electron
+     * shared texture as soon as the GPU has consumed it, instead of pinning it for the whole read-back —
      * which otherwise drains Electron's compositor frame pool.
      *
      * `readbackConsume` opens the texture, GPU-converts it into an internal buffer keyed by `poolKey`, and
@@ -61,7 +63,7 @@ declare module "osr-capture" {
     export function readbackConsume(source: Buffer | DmabufInfo, width: number, height: number, format: ReadbackFormat, poolKey: string, dstWidth?: number, dstHeight?: number): Promise<void>
 
     /**
-     * Phase 2 of the two-phase readback (Windows / Linux-GPU, see {@link readbackConsume}). Copies the consumed frame out. Resolves the converted
+     * Phase 2 of the two-phase readback (see {@link readbackConsume}). Copies the consumed frame out. Resolves the converted
      * `Buffer` when no downscale was requested, or `{ main, scaled }` when `dstWidth`/`dstHeight` were given to
      * {@link readbackConsume} (`main` = the `format` buffer, `scaled` = `dstWidth * dstHeight * 4` BGRA).
      */

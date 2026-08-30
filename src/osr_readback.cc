@@ -186,25 +186,28 @@ Napi::Value Readback(const Napi::CallbackInfo& info) {
     return deferred.Promise();
 }
 
-#if defined(_WIN32) || defined(__linux__)
-// Two-phase readback (Windows + Linux-GPU): consume opens+GPU-converts the shared texture / imported
-// dmabuf and returns once the GPU has read it (so the caller can release the Electron texture); finish
-// does the slow copy into a pooled buffer. This keeps the shared texture pinned only for the GPU phase,
-// not the whole readback.
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+// Two-phase readback (all three GPU backends): consume opens+GPU-converts the shared texture / IOSurface /
+// imported dmabuf and returns once the GPU has read it (so the caller can release the Electron texture);
+// finish does the copy into a pooled buffer. This keeps the shared texture pinned only for the GPU phase,
+// not the whole readback. On Windows/Linux the copy is the slow bus read; on macOS unified memory it is a
+// cached memcpy, but the early release still matters because it hands the compositor's frame pool its
+// surface back a full copy sooner.
+// Windows and macOS take a shared-texture handle; Linux takes dmabuf planes — hence the ctor/Execute split.
 class ConsumeWorker : public Napi::AsyncWorker {
 public:
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     ConsumeWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, Napi::Promise::Deferred deferred)
         : Napi::AsyncWorker(env), handle_(handle), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), deferred_(deferred) {}
-#else
+#elif defined(__linux__)
     ConsumeWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH, Napi::Promise::Deferred deferred)
         : Napi::AsyncWorker(env), planes_(std::move(planes)), modifier_(modifier), w_(w), h_(h), format_(format), key_(std::move(key)), dstW_(dstW), dstH_(dstH), deferred_(deferred) {}
 #endif
     void Execute() override {
         std::string err;
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
         bool ok = osrcap::ReadbackConsume(handle_, w_, h_, format_, key_, dstW_, dstH_, err);
-#else
+#elif defined(__linux__)
         bool ok = osrcap::ReadbackConsume(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, err);
 #endif
         if (!ok) SetError(err.empty() ? "consume failed" : err);
@@ -216,9 +219,9 @@ public:
     void OnError(const Napi::Error& e) override { deferred_.Reject(e.Value()); }
 
 private:
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     uintptr_t handle_;
-#else
+#elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes_;
     uint64_t modifier_ = 0;
 #endif
@@ -275,7 +278,7 @@ private:
 // downscale was requested, else just the main Buffer (same shape as FinishWorker).
 class ReadbackOnceWorker : public Napi::AsyncWorker {
 public:
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     ReadbackOnceWorker(Napi::Env env, uintptr_t handle, uint32_t w, uint32_t h, int format, uint32_t dstW, uint32_t dstH,
                        uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result,
                        uint8_t* scaledDst, size_t scaledSize, bool hasScaled, Napi::Buffer<uint8_t> scaledResult,
@@ -285,7 +288,7 @@ public:
           scaledDst_(scaledDst), scaledSize_(scaledSize), hasScaled_(hasScaled), release_(release), deferred_(deferred) {
         if (hasScaled) scaledRef_ = Napi::Persistent(scaledResult);
     }
-#else
+#elif defined(__linux__)
     ReadbackOnceWorker(Napi::Env env, std::vector<osrcap::DmabufPlane> planes, uint64_t modifier, uint32_t w, uint32_t h, int format, std::string key, uint32_t dstW, uint32_t dstH,
                        uint8_t* dst, size_t dstSize, Napi::Buffer<uint8_t> result,
                        uint8_t* scaledDst, size_t scaledSize, bool hasScaled, Napi::Buffer<uint8_t> scaledResult,
@@ -308,10 +311,10 @@ public:
             released = true;
             release_.NonBlockingCall();
         };
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
         bool ok = osrcap::ReadbackOnce(handle_, w_, h_, format_, dstW_, dstH_, dst_, dstSize_,
                                        scaledDst_, scaledSize_, onGpuDone, err);
-#else
+#elif defined(__linux__)
         bool ok = osrcap::ReadbackOnce(planes_, modifier_, w_, h_, format_, key_, dstW_, dstH_, dst_, dstSize_,
                                        scaledDst_, scaledSize_, onGpuDone, err);
 #endif
@@ -339,9 +342,9 @@ public:
     }
 
 private:
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     uintptr_t handle_;
-#else
+#elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes_;
     uint64_t modifier_ = 0;
     std::string key_;
@@ -382,14 +385,14 @@ Napi::Value ReadbackOnceJs(const Napi::CallbackInfo& info) {
 
     // one-shot TSFN (initialThreadCount 1) so the worker thread can invoke onRelease on the JS loop mid-Execute.
     Napi::ThreadSafeFunction release = Napi::ThreadSafeFunction::New(env, onRelease, "osrReadbackRelease", 0, 1);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     uintptr_t handle = 0;
     Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
     if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     (new ReadbackOnceWorker(env, handle, w, h, format, dstW, dstH, result.Data(), outSize, result,
                             hasScaled ? scaledResult.Data() : nullptr, scaledSize, hasScaled, scaledResult, release, deferred))
         ->Queue();
-#else
+#elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes;
     uint64_t modifier = 0;
     ParseLinuxSource(info[0], planes, modifier);
@@ -410,12 +413,12 @@ Napi::Value ReadbackConsumeJs(const Napi::CallbackInfo& info) {
     uint32_t dstW = (info.Length() > 5 && info[5].IsNumber()) ? info[5].As<Napi::Number>().Uint32Value() : 0;
     uint32_t dstH = (info.Length() > 6 && info[6].IsNumber()) ? info[6].As<Napi::Number>().Uint32Value() : 0;
     auto deferred = Napi::Promise::Deferred::New(env);
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)
     uintptr_t handle = 0;
     Napi::Buffer<uint8_t> buf = info[0].As<Napi::Buffer<uint8_t>>();
     if (buf.Length() >= sizeof(uintptr_t)) std::memcpy(&handle, buf.Data(), sizeof(uintptr_t));
     (new ConsumeWorker(env, handle, w, h, format, std::move(key), dstW, dstH, deferred))->Queue();
-#else
+#elif defined(__linux__)
     std::vector<osrcap::DmabufPlane> planes;
     uint64_t modifier = 0;
     ParseLinuxSource(info[0], planes, modifier);
@@ -469,15 +472,16 @@ Napi::Value CopyPoolSelfTestJs(const Napi::CallbackInfo& info) {
 Napi::Value CopyPoolActiveWorkersJs(const Napi::CallbackInfo& info) {
     return Napi::Number::New(info.Env(), osrcap::CopyPoolActiveWorkers());
 }
-#endif
+#endif  // _WIN32 (copy-pool harness)
 
 // Backend telemetry. Windows (Stage-2 sub-step B): the copy-out backend in use ("d3d11on12" | "d3d11" |
 // "none") — the §5 ladder picks it; FS_READBACK=d3d11 is a binary diagnostic selector, not a tunable.
+// macOS: "metal" (IOSurface wrapped zero-copy as an MTLTexture) | "iosurface-cpu" | "none".
 // Linux: "egl-gles3" (GPU readback active) | "cpu" (unavailable/forced/demoted) | "none". Read-only.
 Napi::Value ReadbackBackendJs(const Napi::CallbackInfo& info) {
     return Napi::String::New(info.Env(), osrcap::ReadbackBackend());
 }
-#endif
+#endif  // _WIN32 || __APPLE__ || __linux__
 
 // Free a pool's reused buffers when its output is removed (else the per-output buffers leak for the process
 // lifetime). No-op if the key is unknown.
@@ -490,7 +494,7 @@ Napi::Value ReleasePool(const Napi::CallbackInfo& info) {
             data->pools.erase(key);
             data->pools.erase(key + "#scaled");
         }
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
         osrcap::ReadbackReleaseKey(key);
 #endif
     }
@@ -510,23 +514,34 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     env.SetInstanceData(new AddonData());
     exports.Set("readback", Napi::Function::New(env, Readback));
     exports.Set("releasePool", Napi::Function::New(env, ReleasePool));
+    // The two-phase/once exports are installed ONLY when this platform's GPU path is actually available —
+    // FreeShow keys off `typeof readbackConsume === "function"` (ndiWorker two-phase preference,
+    // OutputLifecycle hasGpuDownscale) and must fall back to single-phase `readback` when only a CPU path
+    // exists. Windows always has D3D11 here (the §5 ladder degrades internally); macOS needs a Metal device;
+    // Linux needs the EGL/GLES3 import to have initialized.
 #if defined(_WIN32)
     exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
     exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
     exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
-    exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));
-    exports.Set("_copyPoolActiveWorkers", Napi::Function::New(env, CopyPoolActiveWorkersJs));
-    exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
+#elif defined(__APPLE__)
+    if (osrcap::MacGpuReadbackInit()) {
+        exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
+        exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
+        exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
+    }
 #elif defined(__linux__)
-    // The two-phase/once exports are installed ONLY when the GPU (EGL/GLES3) path initialized — FreeShow
-    // keys off `typeof readbackConsume === "function"` (ndiWorker two-phase preference, OutputLifecycle
-    // hasGpuDownscale) and must fall back to single-phase `readback` when only the CPU path exists.
     if (osrcap::LinuxGpuReadbackInit()) {
         exports.Set("readbackOnce", Napi::Function::New(env, ReadbackOnceJs));
         exports.Set("readbackConsume", Napi::Function::New(env, ReadbackConsumeJs));
         exports.Set("readbackFinish", Napi::Function::New(env, ReadbackFinishJs));
     }
+#endif
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     exports.Set("_readbackBackend", Napi::Function::New(env, ReadbackBackendJs));
+#endif
+#if defined(_WIN32)
+    exports.Set("_copyPoolSelfTest", Napi::Function::New(env, CopyPoolSelfTestJs));
+    exports.Set("_copyPoolActiveWorkers", Napi::Function::New(env, CopyPoolActiveWorkersJs));
 #endif
     osrcap::RegisterConvert(env, exports);
     return exports;

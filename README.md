@@ -21,7 +21,7 @@ Built for FreeShow (https://github.com/ChurchApps/FreeShow), but generic.
 | Platform | Backend | Status |
 | --- | --- | --- |
 | Windows | Direct3D 11 (`OpenSharedResource` + staging texture) | Implemented & validated |
-| macOS | IOSurface (`IOSurfaceLock` + row copy) | Implemented — needs testing on macOS |
+| macOS | GPU readback (IOSurface wrapped zero-copy as an `MTLTexture` + Metal compute convert/downscale), `IOSurfaceLock` + row copy CPU fallback | Implemented & validated — the GPU path converts to UYVY/UYVA/RGBA and downscales on the GPU, so only the reduced result reaches the CPU; on Apple Silicon the output buffer is `StorageModeShared`, making the copy-out a cached memcpy with no bus transfer. Falls back automatically to the CPU path when there is no Metal device, the surface is not BGRA, or the width is not a multiple of 4. The two-phase API is available whenever a Metal device exists (feature-detect via presence of `readbackConsume`, same as Windows) |
 | Linux | GPU readback (EGL dmabuf import + GLES3 convert), CPU dmabuf `mmap` fallback | Implemented — the GPU path handles tiled/compressed modifiers and converts on the GPU (reads back the converted output instead of raw BGRA, far faster); when EGL/dmabuf import is unavailable it falls back automatically to a per-frame CPU `mmap` (LINEAR modifier only). The two-phase API is available on Linux when the GPU path initialized (feature-detect via presence of `readbackConsume`, same as Windows) |
 
 Where the addon fails to load or a readback isn't supported for the given frame, callers should fall back

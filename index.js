@@ -2,11 +2,12 @@
 // See index.d.ts for the full typed API. Summary:
 //   readback(source, width, height, format = 0, poolKey?) => Promise<Buffer>
 //     format 0 = BGRA (tightly-packed), 1 = UYVY (opaque), 2 = UYVA (colour + full-res alpha), 3 = RGBA.
-//     Windows converts on the GPU (compute shader); Linux converts on the GPU too when the EGL/GLES3 path
-//     initialized (see LINUX_GPU_READBACK.md), else CPU; mac converts on the CPU.
+//     All platforms convert on the GPU: Windows a D3D11 compute shader, macOS a Metal compute kernel on the
+//     IOSurface wrapped zero-copy as an MTLTexture, Linux EGL/GLES3 when that path initialized (see
+//     LINUX_GPU_READBACK.md). Each falls back to the CPU converter only when its GPU path is unavailable.
 //   readbackConsume(source, w, h, format, poolKey, dstW?, dstH?) / readbackFinish(poolKey, w, h, format, dstW?, dstH?)
-//     Two-phase readback (Windows always; Linux when the GPU path is active — absent otherwise): release the
-//     shared texture right after the GPU consume, then do the slow copy.
+//     Two-phase readback (Windows always; macOS when a Metal device exists; Linux when the GPU path is
+//     active — absent otherwise): release the shared texture right after the GPU consume, then copy out.
 //     dstW/dstH also GPU-downscale a small BGRA in the same pass -> readbackFinish resolves { main, scaled }.
 //   releasePool(poolKey)                                  // free a poolKey's reused output buffers
 //   convertBgraToUyvy / convertBgraToUyva(bgra, w, h)     // CPU fallback converters (sync)
