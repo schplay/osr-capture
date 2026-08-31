@@ -42,13 +42,15 @@
                 [
                     "OS=='linux'",
                     {
-                        # GPU readback (readback_linux_gpu.cc) needs EGL + GLES2/3 headers at compile time
-                        # (apt: libegl1-mesa-dev libgles2-mesa-dev) and links the runtime libs directly
-                        # (libegl1/libgles2 — present on any GPU-composited desktop). DRM fourcc/modifier
-                        # constants are defined locally, so libdrm-dev is NOT required.
+                        # Self-contained build: the EGL/GLES2/GLES3 headers are vendored
+                        # (third_party/khronos) and the link targets the runtime sonames
+                        # (-l:libEGL.so.1 / -l:libGLESv2.so.2, shipped by libegl1/libgles2 on any
+                        # GPU-composited desktop), so no -dev packages are needed to install.
+                        # DRM fourcc/modifier constants are defined locally: no libdrm-dev either.
                         "sources": ["src/readback_linux.cc", "src/readback_linux_gpu.cc"],
+                        "include_dirs": ["third_party/khronos"],
                         "cflags_cc": ["-std=c++17", "-fexceptions"],
-                        "libraries": ["-lEGL", "-lGLESv2"]
+                        "libraries": ["-l:libEGL.so.1", "-l:libGLESv2.so.2"]
                     }
                 ]
             ]

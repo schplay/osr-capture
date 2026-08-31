@@ -78,8 +78,9 @@ Set `FS_LINUX_READBACK=cpu` to force the CPU `mmap` fallback (bypassing the GPU 
 ## Build
 
 Native addon (node-gyp + `node-addon-api`). Requires a C++17 toolchain and the Windows SDK (`d3d11.h`,
-`dxgi1_2.h`). On Linux, building needs `libegl1-mesa-dev` and `libgles2-mesa-dev`; at runtime the addon
-links against `libegl1` and `libgles2`.
+`dxgi1_2.h`). On Linux no development packages are needed: the EGL/GLES headers are vendored
+(`third_party/khronos`) and the addon links the runtime libraries directly (`libEGL.so.1` /
+`libGLESv2.so.2`, shipped by `libegl1`/`libgles2` — present on any GPU-composited desktop).
 
 Against Node:
 
